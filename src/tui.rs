@@ -476,7 +476,7 @@ fn shorten_id(id: &str) -> String {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
     ("/model", "pick a model from the live list"),
-    ("/reasoning", "thinking depth: normal · low · medium · high · max"),
+    ("/reasoning", "thinking depth: normal · low · medium · high · max (auto-detected)"),
     ("/approvals", "switch approval mode (plan/build/full-auto)"),
     ("/provider", "menu: add · use · edit · list"),
     ("/compact", "summarize history to free context"),

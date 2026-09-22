@@ -552,16 +552,11 @@ fn worker_main(
                 // the live ActiveProvider and hot-swap the client so the very
                 // next request uses the new hint.
                 let name = app.active.name.clone();
-                let headers = app.active.headers.clone();
-                let send_reasoning = app.active.name == "openrouter"
-                    || app.active.base_url.contains("openrouter");
                 if let Some(p) = app.config.providers.get_mut(&name) {
                     p.reasoning_effort = effort.clone();
                 }
                 app.active.reasoning_effort = effort.clone();
-                let mut active = app.active.clone();
-                active.headers = headers;
-                if let Ok(client) = rebuild_client_from(&active, send_reasoning) {
+                if let Ok(client) = rebuild_client(&app.active) {
                     app.agent.client = client;
                 }
                 let res = app.config.save();
@@ -926,7 +921,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             WorkerCmd::SetupListModels { base_url, api_key } => {
                 // Authenticated catalog peek — this doubles as proof that
                 // the freshly typed key actually works before we save it.
-                let probe = ChatClient::new(&base_url, &api_key, &Default::default(), false, None, "openai");
+                let probe = ChatClient::new(&base_url, &api_key, &Default::default(), None, "openai");
                 match probe.and_then(|c| rt.block_on(c.list_models())) {
                     Ok(models) => {
                         let _ = ev_tx.send(WorkerEvent::Pick {
@@ -997,7 +992,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let _ = ev_tx.send(WorkerEvent::Error(format!("provider '{name}' not found")));
                     continue;
                 };
-                let client = ChatClient::new(&p.base_url, &p.api_key, &p.headers, false, None, &p.kind);
+                let client = ChatClient::new(&p.base_url, &p.api_key, &p.headers, None, &p.kind);
                 match client.and_then(|c| rt.block_on(c.list_models())) {
                     Ok(models) => {
                         let mut items = with_manual_model_entry(models);
@@ -2036,7 +2031,6 @@ impl App {
             &active.base_url,
             &active.api_key,
             &active.headers,
-            active.name == "openrouter" || active.base_url.contains("openrouter"),
             active.reasoning_effort.clone(),
             &active.kind,
         )?;
@@ -2066,7 +2060,7 @@ impl App {
             sources: Default::default(),
             reasoning_effort: None,
         };
-        let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, false, None, "openai")?;
+        let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, None, "openai")?;
         let agent = Agent::new(
             client,
             String::new(),
@@ -2254,9 +2248,9 @@ pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
             }
             "assistant" => {
                 for tc in &m.tool_calls {
-                    open_calls.insert(tc.id.clone(), tc.function.name.clone());
+                    open_calls.insert(tc.id.clone(), tc.tool_name().to_string());
                     let summary = tools::parse_tool_action(
-                        &tc.function.name,
+                        tc.tool_name(),
                         &tc.function.arguments,
                     )
                     .map(|a| a.describe())
@@ -2370,9 +2364,35 @@ fn reasoning_label_to_effort(label: &str) -> Option<String> {
     }
 }
 
-/// All labels the `/reasoning` picker offers.
+/// Every label the `/reasoning` picker may ever offer (the visible list is
+/// model-aware — see [`reasoning_choices`]); also the accepted set for
+/// validation of any label that does come back.
 const REASONING_CHOICES: &[&str] =
     &["normal (model default)", "default (model default)", "low", "medium", "high", "max"];
+
+/// Whether the active model accepts `reasoning_effort: "max"` (the xAI
+/// spelling, used by Grok reasoning models). Everything else speaks the
+/// OpenAI sector-standard low/medium/high only.
+fn model_offers_max_effort(model: &str, provider: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("grok") || provider.eq_ignore_ascii_case("xai")
+}
+
+/// The `/reasoning` picker entries for the active model — `max` is only
+/// shown when the model supports it instead of advertising a level many
+/// models can't consume.
+fn reasoning_choices(model: &str, provider: &str) -> Vec<String> {
+    let mut out = vec![
+        "normal (model default)".into(),
+        "low".into(),
+        "medium".into(),
+        "high".into(),
+    ];
+    if model_offers_max_effort(model, provider) {
+        out.push("max".into());
+    }
+    out
+}
 
 /// True when the label is one of the picker's own entries (used to tell a
 /// valid "clear the hint" choice apart from an unknown label).
@@ -2404,7 +2424,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                 "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
                  SESSION\n\
                    /model        pick a model                                    /status    provider · model · info\n\
-                   /reasoning    thinking depth (normal·low·med·high·max)      /approvals switch approval mode (or Tab)\n\
+                   /reasoning    thinking depth (auto-detected: normal·low·med·high[·max])      /approvals switch approval mode (or Tab)\n\
                    /agents       list the specialist sub-agent team             /session   rename · search · list\n\
                    /skills       search & pick a skill to use                   /resume    restore a previous session\n\
                    /compact      summarize history to free context              /export    save transcript as markdown\n\
@@ -2515,19 +2535,10 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             let _ = cmd.send(WorkerCmd::ListModels);
         }
         "reasoning" | "effort" | "thinking" => {
-            // Static picker, same shape as /approvals; the choice comes
-            // back as OpenSlash("reasoning:<label>").
-            tui.open_picker(
-                "reasoning",
-                vec![
-                    "normal (model default)".into(),
-                    "default (model default)".into(),
-                    "low".into(),
-                    "medium".into(),
-                    "high".into(),
-                    "max".into(),
-                ],
-            );
+            // Model-aware picker, same shape as /approvals; the choice comes
+            // back as OpenSlash("reasoning:<label>"). "max" is the xAI
+            // spelling and is only offered when the active model speaks it.
+            tui.open_picker("reasoning", reasoning_choices(&tui.dash.model, &tui.dash.provider));
         }
         "retry" => {
             tui.set_status("retrying");
@@ -2826,6 +2837,10 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
     ProviderPreset { name: "openrouter", base_url: "https://openrouter.ai/api/v1", kind: "openai", model: "" },
     ProviderPreset { name: "tokenrouter", base_url: "https://api.tokenrouter.com/v1", kind: "openai", model: "" },
     ProviderPreset { name: "openai", base_url: "https://api.openai.com/v1", kind: "openai", model: "" },
+    // Google's OpenAI-compatible endpoint. Gemini 3+ models gate tool calls
+    // on thought signatures — the client detects this endpoint and handles
+    // the signature roundtrip automatically.
+    ProviderPreset { name: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", kind: "openai", model: "" },
     ProviderPreset { name: "anthropic", base_url: "https://api.anthropic.com/v1", kind: "openai", model: "" },
     ProviderPreset { name: "groq", base_url: "https://api.groq.com/openai/v1", kind: "openai", model: "" },
     ProviderPreset { name: "deepseek", base_url: "https://api.deepseek.com/v1", kind: "openai", model: "" },
@@ -2881,20 +2896,14 @@ fn with_manual_model_entry(mut models: Vec<String>) -> Vec<String> {
     models
 }
 
-/// Rebuild the live client for an already-resolved provider, deciding the
-/// OpenRouter "reasoning" passthrough flag from the endpoint itself.
+/// Rebuild the live client for an already-resolved provider. The reasoning
+/// dialect (OpenRouter extension vs OpenAI param vs Google Gemini) is
+/// detected from the endpoint itself — never hardcoded per provider name.
 pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
-    rebuild_client_from(active, active.name == "openrouter" || active.base_url.contains("openrouter"))
-}
-
-/// Same, with an explicit OpenRouter flag (used when the provider record
-/// and the resolved view must stay independent).
-fn rebuild_client_from(active: &ActiveProvider, openrouter: bool) -> Result<ChatClient> {
     ChatClient::new(
         &active.base_url,
         &active.api_key,
         &active.headers,
-        openrouter,
         active.reasoning_effort.clone(),
         &active.kind,
     )
@@ -2986,7 +2995,7 @@ fn finish_provider_setup(
     // anything — a public /models endpoint can't tell a good key from a bad
     // one. Keyless free providers are verified through their own transport.
     if !is_local {
-        let probe = ChatClient::new(base_url, &p.api_key, &p.headers, false, None, &p.kind)?;
+        let probe = ChatClient::new(base_url, &p.api_key, &p.headers, None, &p.kind)?;
         rt.block_on(probe.probe_chat(&p.model)).with_context(|| {
             format!("'{sanitized}' was NOT saved — nothing changed. Fix the model and retry /provider add")
         })?;
@@ -3081,7 +3090,7 @@ fn finish_edit_api_key(
             (p.base_url.clone(), p.model.clone(), p.headers.clone())
         };
         if !is_local {
-            let probe = ChatClient::new(&base_url, api_key.trim(), &headers, false, None, "openai")?;
+            let probe = ChatClient::new(&base_url, api_key.trim(), &headers, None, "openai")?;
             rt.block_on(probe.probe_chat(&model)).with_context(|| {
                 "key rejected — old key kept unchanged"
             })?;
@@ -3415,6 +3424,24 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_choices_are_model_aware() {
+        // Non-xAI models get normal/low/medium/high, never max.
+        let base = reasoning_choices("gpt-5-codex", "openai");
+        assert_eq!(
+            base,
+            vec!["normal (model default)", "low", "medium", "high"]
+        );
+        // Even the free Gemini preset stays forthright — the endpoint
+        // ignores reasoning_effort entirely but the picker still offers
+        // the portable levels only.
+        assert!(reasoning_choices("gemini-3.5-flash", "gemini").iter().all(|c| c != "max"));
+        // Grok models (and the xai provider preset) unlock max.
+        assert!(reasoning_choices("grok-3.5-reasoner", "xai").contains(&"max".to_string()));
+        assert!(reasoning_choices("grok-4", "tokenrouter").contains(&"max".to_string()));
+        assert!(reasoning_choices("something-else", "xai").contains(&"max".to_string()));
+    }
+
+    #[test]
     fn cli_verification_skips_local_servers_without_network() {
         let p = Provider {
             base_url: "http://localhost:11434/v1".into(),
@@ -3596,6 +3623,7 @@ mod tests {
                         name: "run_command".into(),
                         arguments: r#"{"command":"cargo build"}"#.into(),
                     },
+                    extra_content: None,
                 }],
                 None,
             ),

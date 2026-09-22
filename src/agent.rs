@@ -504,7 +504,7 @@ Working rules:
                 // tell the model to change strategy instead of burning
                 // rounds (and tokens) on the same failing action.
                 let key = (
-                    tc.function.name.clone(),
+                    tc.tool_name().to_string(),
                     tc.function.arguments.clone(),
                 );
                 recent_calls.push(key);
@@ -514,7 +514,7 @@ Working rules:
                     && recent_calls[n - 2] == recent_calls[n - 3]
                 {
                     ui.on_event(AgentEvent::ToolDone {
-                        name: tc.function.name.clone(),
+                        name: tc.tool_name().to_string(),
                         ok: false,
                         preview: "doom-loop blocked".into(),
                     });
@@ -550,10 +550,11 @@ Working rules:
 
     async fn execute_call(&mut self, tc: &ToolCall, ui: &mut dyn UiSink, image_attachments: &mut Vec<Message>, cancel: Option<&std::sync::atomic::AtomicBool>) -> String {
         // Orchestration tool — handled before the regular action pipeline.
-        if tc.function.name == "delegate" {
+        // (tool_name() strips provider namespaces like Gemini's `default_api:`.)
+        if tc.tool_name() == "delegate" {
             return self.execute_delegate(&tc.function.arguments, ui).await;
         }
-        let action = match tools::parse_tool_action(&tc.function.name, &tc.function.arguments) {
+        let action = match tools::parse_tool_action(tc.tool_name(), &tc.function.arguments) {
             Ok(a) => a,
             Err(e) => return format!("Error parsing tool call: {e}"),
         };
@@ -565,7 +566,7 @@ Working rules:
                 .to_string();
         }
 
-        let name = tc.function.name.clone();
+        let name = tc.tool_name().to_string();
         // Permission rules (config [permission.*]) override the danger
         // heuristics: deny short-circuits, ask forces the modal even for
         // safe reads, allow auto-approves the matched input.
@@ -617,7 +618,7 @@ Working rules:
             );
         }
 
-        let name = tc.function.name.clone();
+        let name = tc.tool_name().to_string();
         let summary = action.describe();
         ui.on_event(AgentEvent::ToolStart { name: name.clone(), summary });
 
@@ -889,7 +890,7 @@ mod tests {
         std::fs::write(dir.join("src/exists.rs"), "original\n").unwrap();
         std::fs::write(dir.join("src/doomed.rs"), "bye\n").unwrap();
 
-        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None, "openai")
+        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), None, "openai")
             .expect("client");
         let mut agent = Agent::new(
             client,
@@ -945,7 +946,7 @@ mod tests {
         std::fs::write(dir.join("src/a.rs"), "v0\n").unwrap();
         std::fs::write(dir.join("src/b.rs"), "v0\n").unwrap();
 
-        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), false, None, "openai")
+        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), None, "openai")
             .expect("client");
         let mut agent = Agent::new(
             client,

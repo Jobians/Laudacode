@@ -30,7 +30,7 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 - 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto` (+ hard confirmation for dangerous commands)
 - 🖼️ **Image input** — attach screenshots or photos for vision models (`-i`, `/image`)
 - 📡 **Streaming responses** with reasoning-model support (dimmed "thinking" indicator)
-- 🎨 **12 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice (`/theme`, persisted)
+- 🎨 **13 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice, hacker (`/theme`, persisted)
 - ✨ **Ambient effects** — cherry petals 🌸, rain, snow, matrix rain, lightning ⚡, stars, fireflies, bubbles, embers, confetti, meteor comets, aurora (`/effect`, rendered in the banner only)
 - 🌈 **Syntax highlighting** — code blocks and diffs colored per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
 - ⌨️ **Prompt history** — ↑/↓ recall with draft restore; persisted across sessions

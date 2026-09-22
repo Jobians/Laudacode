@@ -340,21 +340,23 @@ async fn run_loop(
             if turn.content.is_empty() { None } else { Some(turn.content) },
         ));
         for tc in turn.tool_calls {
+            // tool_name() strips provider namespaces (Gemini `default_api:`).
+            let tool_name = tc.tool_name().to_string();
             // Toolset restriction is enforced again at execution time.
-            if !spec.allowed.iter().any(|a| a == &tc.function.name) {
+            if !spec.allowed.iter().any(|a| a == &tool_name) {
                 messages.push(Message::tool_result(
                     &tc.id,
-                    format!("blocked: '{}' is outside the {} role", tc.function.name, spec.name),
+                    format!("blocked: '{tool_name}' is outside the {} role", spec.name),
                 ));
                 continue;
             }
             let action = crate::tools::parse_tool_action(
-                &tc.function.name,
+                &tool_name,
                 &tc.function.arguments,
             )
             .map_err(|e| e.context("parsing sub-agent tool call"))?;
             ui.on_event(AgentEvent::ToolStart {
-                name: format!("{}/{}", spec.name, tc.function.name),
+                name: format!("{}/{tool_name}", spec.name),
                 summary: action.describe(),
             });
             // Same approval policy as the orchestrator: Safe flows through,
@@ -374,7 +376,7 @@ async fn run_loop(
                     Ok((out, files)) => {
                         if !files.is_empty() {
                             ui.on_event(AgentEvent::ToolEdit {
-                                name: format!("{}/{}", spec.name, tc.function.name),
+                                name: format!("{}/{tool_name}", spec.name),
                                 files,
                             });
                         }
@@ -384,7 +386,7 @@ async fn run_loop(
                 }
             };
             ui.on_event(AgentEvent::ToolDone {
-                name: format!("{}/{}", spec.name, tc.function.name),
+                name: format!("{}/{tool_name}", spec.name),
                 ok: !result.starts_with("Command failed") && !result.contains("DECLINED") && !result.starts_with("blocked"),
                 preview: result.chars().take(160).collect(),
             });

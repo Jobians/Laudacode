@@ -1,5 +1,5 @@
 //! UI themes — one struct describing every palette slot (syntax, chrome and
-//! banner), twelve built-ins, swappable at runtime via `/theme`.
+//! banner), thirteen built-ins, swappable at runtime via `/theme`.
 
 use ratatui::style::Color;
 
@@ -570,7 +570,49 @@ pub static ICE: Theme = Theme {
     overlay: Color::Black,
 };
 
-pub static ALL: &[&Theme] = &[&LAUDA, &CHERRY, &MIDNIGHT, &NORD, &DRACULA, &MONOKAI, &SOLARIZED, &GRUVBOX, &TOKYO, &EVERFOREST, &EMBER, &ICE];
+/// Matrix-green phosphor on black.
+pub static HACKER: Theme = Theme {
+    name: "hacker",
+    accent: rgb(0, 255, 65),
+    accent2: rgb(0, 200, 120),
+    heading: rgb(0, 255, 128),
+    bullet: rgb(0, 255, 65),
+    text: rgb(180, 255, 180),
+    dim: rgb(0, 128, 0),
+    gray: rgb(0, 160, 80),
+    success: rgb(0, 255, 65),
+    error: rgb(255, 80, 80),
+    warning: rgb(255, 220, 80),
+    user: rgb(120, 255, 200),
+    mode_plan: rgb(120, 220, 255),
+    mode_build: rgb(0, 255, 65),
+    mode_full: rgb(255, 220, 80),
+    code_fg: rgb(170, 255, 170),
+    code_bg: rgb(0, 12, 0),
+    rule: rgb(0, 90, 40),
+    add_bg: rgb(0, 40, 10),
+    del_bg: rgb(50, 10, 10),
+    kw: rgb(255, 200, 60),
+    string: rgb(120, 255, 200),
+    comment: rgb(0, 128, 70),
+    num: rgb(255, 240, 120),
+    ty: rgb(0, 255, 200),
+    func: rgb(0, 255, 65),
+    mac: rgb(0, 200, 255),
+    op: rgb(0, 255, 65),
+    banner: [rgb(0, 255, 65), rgb(0, 200, 120), rgb(0, 90, 20)],
+    border: rgb(0, 110, 50),
+    border_focus: rgb(0, 255, 65),
+    surface: rgb(0, 28, 8),
+    surface_fg: rgb(180, 255, 180),
+    hint_key: rgb(0, 255, 65),
+    hint_text: rgb(0, 150, 80),
+    bar_fill: rgb(0, 255, 65),
+    bar_empty: rgb(0, 45, 18),
+    overlay: Color::Black,
+};
+
+pub static ALL: &[&Theme] = &[&LAUDA, &CHERRY, &MIDNIGHT, &NORD, &DRACULA, &MONOKAI, &SOLARIZED, &GRUVBOX, &TOKYO, &EVERFOREST, &EMBER, &ICE, &HACKER];
 pub static DEFAULT: &Theme = &LAUDA;
 
 pub fn names() -> Vec<&'static str> {

@@ -151,6 +151,30 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: FunctionCall,
+    /// Provider-specific passthrough attached to a tool call by the wire
+    /// format. Google's OpenAI-compatible endpoint (Gemini) puts
+    /// `extra_content.google.thought_signature` here and REQUIRES it echoed
+    /// back verbatim on the next request — dropping it turns every
+    /// follow-up turn into a 400 INVALID_ARGUMENT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
+}
+
+impl ToolCall {
+    /// Name to dispatch locally: some Gemini models emit calls namespaced
+    /// as `default_api:grep` — strip the prefix so the call matches the
+    /// declared tool registry. `function.name` itself stays verbatim for
+    /// byte-faithful history replay (thought signatures sign the call as
+    /// emitted).
+    pub fn tool_name(&self) -> &str {
+        clean_tool_name(&self.function.name)
+    }
+}
+
+/// Strip provider namespaces (`default_api:grep` → `grep`).
+pub fn clean_tool_name(name: &str) -> &str {
+    let n = name.trim();
+    n.strip_prefix("default_api:").unwrap_or(n)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,13 +225,45 @@ pub struct Turn {
     pub usage: Option<Usage>,
 }
 
+/// How to ask a provider for reasoning / thinking, derived from the
+/// endpoint — never hardcoded per provider name or model list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningStyle {
+    /// OpenRouter extension: `"reasoning": { "enabled": true }`.
+    OpenRouter,
+    /// OpenAI chat-completions `"reasoning_effort"` param (also understood
+    /// by most OpenAI-compatible gateways).
+    OpenAi,
+    /// Google Gemini: no reasoning flag is sent. The model reasons on its
+    /// own and requires its `thought_signature`s echoed back on tool calls
+    /// (handled by the ToolCall extra_content roundtrip).
+    Google,
+}
+
+impl ReasoningStyle {
+    /// Detect the dialect from the endpoint URL. Order matters: an
+    /// OpenRouter URL wins over model strings, and the Google check only
+    /// fires for the OpenAI-compatible transport (built-in free providers
+    /// have their own body shapes entirely).
+    pub fn detect(base_url: &str, kind: &str) -> Self {
+        if kind == "openai" && base_url.contains("generativelanguage.googleapis.com") {
+            Self::Google
+        } else if base_url.contains("openrouter") {
+            Self::OpenRouter
+        } else {
+            Self::OpenAi
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
     extra_headers: BTreeMap<String, String>,
-    send_reasoning: bool,
+    /// Which reasoning-request dialect this endpoint speaks.
+    reasoning_style: ReasoningStyle,
     /// `reasoning_effort` hint for reasoning models ("low"|"medium"|"high").
     reasoning_effort: Option<String>,
     /// Transport kind: "openai" (default) or a built-in free provider
@@ -228,6 +284,14 @@ struct ChunkChoiceDelta {
 }
 
 #[derive(serde::Deserialize)]
+struct DeltaFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct DeltaToolCall {
     #[serde(default)]
     index: usize,
@@ -235,14 +299,76 @@ struct DeltaToolCall {
     id: Option<String>,
     #[serde(default)]
     function: Option<DeltaFunction>,
+    /// Gemini's OpenAI-compat layer:
+    /// `extra_content.google.thought_signature`.
+    #[serde(default)]
+    extra_content: Option<serde_json::Value>,
+    /// Fallback for providers that put a bare signature on the delta.
+    #[serde(default)]
+    thought_signature: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct DeltaFunction {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
+/// Streaming accumulator for one tool call — deltas may fragment the id,
+/// name, arguments and (Gemini) the thought signature across chunks.
+#[derive(Default)]
+struct ToolCallAcc {
+    index: usize,
+    id: String,
+    name: String,
+    arguments: String,
+    extra_content: Option<serde_json::Value>,
+}
+
+impl ToolCallAcc {
+    fn absorb(&mut self, dtc: DeltaToolCall) {
+        self.index = dtc.index;
+        if let Some(id) = dtc.id {
+            self.id = id;
+        }
+        if let Some(f) = dtc.function {
+            if let Some(n) = f.name {
+                self.name.push_str(&n);
+            }
+            if let Some(a) = f.arguments {
+                self.arguments.push_str(&a);
+            }
+        }
+        // Thought signatures ride in once (usually with the id delta); keep
+        // the first non-null payload.
+        let is_null = |v: &Option<serde_json::Value>| match v {
+            Some(x) => x.is_null(),
+            None => true,
+        };
+        let sig = if !is_null(&dtc.extra_content) {
+            dtc.extra_content.clone()
+        } else {
+            dtc.thought_signature.as_ref().map(|s| {
+                serde_json::json!({ "google": { "thought_signature": s } })
+            })
+        };
+        if sig.is_some() && is_null(&self.extra_content) {
+            self.extra_content = sig;
+        }
+    }
+
+    fn finish(self) -> ToolCall {
+        // NOTE: the wire name is kept verbatim (Gemini may emit a namespaced
+        // `default_api:grep`). Thought signatures sign the call exactly as
+        // emitted, so history replay must echo the original; local dispatch
+        // strips the prefix via `ToolCall::tool_name()`.
+        ToolCall {
+            // Some providers omit ids on single calls — synthesize one so
+            // the tool result can always be matched back.
+            id: if self.id.is_empty() {
+                format!("call_{}", self.index)
+            } else {
+                self.id
+            },
+            kind: "function".into(),
+            function: FunctionCall { name: self.name, arguments: self.arguments },
+            extra_content: self.extra_content,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -279,7 +405,6 @@ impl ChatClient {
         base_url: &str,
         api_key: &str,
         headers: &BTreeMap<String, String>,
-        send_reasoning: bool,
         reasoning_effort: Option<String>,
         kind: &str,
     ) -> Result<Self> {
@@ -293,7 +418,7 @@ impl ChatClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             extra_headers: headers.clone(),
-            send_reasoning,
+            reasoning_style: ReasoningStyle::detect(base_url, kind),
             reasoning_effort,
             kind: kind.to_string(),
         })
@@ -404,15 +529,20 @@ pub async fn stream_chat<F>(
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
         }
-        if self.send_reasoning {
-            // OpenRouter-style extension; harmless elsewhere.
-            body["reasoning"] = serde_json::json!({ "enabled": true });
-        }
+        // Reasoning params are dialect-aware: the OpenRouter extension and
+        // the OpenAI chat-completions param are NOT interchangeable, and
+        // Google's Gemini endpoint wants neither (it reasons on its own and
+        // gates tool calls on thought signatures instead).
         if let Some(effort) = &self.reasoning_effort {
             // OpenAI chat-completions param for o-series / gpt-5 reasoning;
             // "max" is the xAI spelling and passes through as-is — picky
             // endpoints ignore unknown values rather than erroring.
             body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        if self.reasoning_style == ReasoningStyle::OpenRouter {
+            // OpenRouter-only extension; Google's endpoint rejects unknown
+            // body fields, so it must never leak there.
+            body["reasoning"] = serde_json::json!({ "enabled": true });
         }
 
         const MAX_ATTEMPTS: usize = 3;
@@ -498,7 +628,7 @@ pub async fn stream_chat<F>(
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
         let mut turn = Turn::default();
-        let mut acc: Vec<(usize, String, String, String)> = Vec::new(); // (index, id, name, args)
+        let mut acc: Vec<ToolCallAcc> = Vec::new();
 
         loop {
             let next = tokio::time::timeout(STREAM_IDLE, stream.next()).await;
@@ -547,24 +677,14 @@ pub async fn stream_chat<F>(
                             }
                             for dtc in choice.delta.tool_calls {
                                 let idx = dtc.index;
-                                let slot = match acc.iter_mut().find(|a| a.0 == idx) {
+                                let slot = match acc.iter_mut().find(|a| a.index == idx) {
                                     Some(s) => s,
                                     None => {
-                                        acc.push((idx, String::new(), String::new(), String::new()));
+                                        acc.push(ToolCallAcc { index: idx, ..Default::default() });
                                         acc.last_mut().unwrap()
                                     }
                                 };
-                                if let Some(id) = dtc.id {
-                                    slot.1 = id;
-                                }
-                                if let Some(f) = dtc.function {
-                                    if let Some(n) = f.name {
-                                        slot.2.push_str(&n);
-                                    }
-                                    if let Some(a) = f.arguments {
-                                        slot.3.push_str(&a);
-                                    }
-                                }
+                                slot.absorb(dtc);
                             }
                             if let Some(fr) = choice.finish_reason {
                                 if !fr.is_empty() {
@@ -577,17 +697,7 @@ pub async fn stream_chat<F>(
             }
         }
 
-        turn.tool_calls = acc
-            .into_iter()
-            .enumerate()
-            .map(|(n, (_, id, name, args))| ToolCall {
-                // Some providers omit ids on single calls — synthesize one so
-                // the tool result can always be matched back.
-                id: if id.is_empty() { format!("call_{n}") } else { id },
-                kind: "function".into(),
-                function: FunctionCall { name, arguments: args },
-            })
-            .collect();
+        turn.tool_calls = acc.into_iter().map(ToolCallAcc::finish).collect();
 
         Ok(turn)
     }
@@ -1126,6 +1236,118 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_style_detection_is_endpoint_driven() {
+        // Google's OpenAI-compatible endpoint (also via a custom provider).
+        assert_eq!(
+            ReasoningStyle::detect("https://generativelanguage.googleapis.com/v1beta/openai", "openai"),
+            ReasoningStyle::Google
+        );
+        assert_eq!(
+            ReasoningStyle::detect("https://openrouter.ai/api/v1", "openai"),
+            ReasoningStyle::OpenRouter
+        );
+        // Everything else speaks the OpenAI chat-completions param.
+        assert_eq!(
+            ReasoningStyle::detect("https://api.openai.com/v1", "openai"),
+            ReasoningStyle::OpenAi
+        );
+        assert_eq!(
+            ReasoningStyle::detect("http://localhost:11434/v1", "openai"),
+            ReasoningStyle::OpenAi
+        );
+        // Built-in free transports never get the Google dialect from URL
+        // sniffing — their body shapes are handled separately.
+        assert_eq!(
+            ReasoningStyle::detect("https://extensions.aitopia.ai/ai/send", "aitopia"),
+            ReasoningStyle::OpenAi
+        );
+    }
+
+    #[test]
+    fn gemini_tool_call_signature_roundtrips_and_name_is_kept_verbatim() {
+        // What Gemini's OpenAI-compat layer actually streams for a tool call:
+        // a namespaced name plus a thought_signature that must be echoed
+        // back byte-faithfully on the next request.
+        let delta = r#"{"index":7,"id":"call-abc","function":{"name":"default_api:grep","arguments":"{\"pattern\":\"x\"}"},"extra_content":{"google":{"thought_signature":"sig123"}}}"#;
+        let parsed: DeltaToolCall = serde_json::from_str(delta).unwrap();
+        let mut acc = ToolCallAcc::default();
+        acc.absorb(parsed);
+        let tc = acc.finish();
+        // Wire name preserved for history replay, clean name for dispatch.
+        assert_eq!(tc.function.name, "default_api:grep");
+        assert_eq!(tc.tool_name(), "grep");
+        let sig = tc.extra_content.clone().expect("signature captured");
+        assert_eq!(
+            sig["google"]["thought_signature"], serde_json::json!("sig123")
+        );
+
+        // Serializing the assistant message back onto the wire keeps the
+        // signature exactly where Gemini expects it.
+        let msg = Message::assistant_with_tools(vec![tc.clone()], None);
+        let v = serde_json::to_value(&msg).unwrap();
+        let wire_call = &v["tool_calls"][0];
+        assert_eq!(
+            wire_call["extra_content"]["google"]["thought_signature"],
+            serde_json::json!("sig123")
+        );
+        assert_eq!(wire_call["function"]["name"], serde_json::json!("default_api:grep"));
+        // And it deserializes back losslessly (session persistence).
+        let back: ToolCall = serde_json::from_value(serde_json::to_value(&tc).unwrap()).unwrap();
+        assert_eq!(back.extra_content, tc.extra_content);
+    }
+
+    #[test]
+    fn non_gemini_tool_calls_serialize_without_extra_content() {
+        let tc = ToolCall {
+            id: "call_0".into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "read_file".into(), arguments: "{}".into() },
+            extra_content: None,
+        };
+        let v = serde_json::to_value(&tc).unwrap();
+        assert!(v.get("extra_content").is_none(), "no signature must not leak a field");
+
+        let msg = Message::assistant_with_tools(vec![tc], None);
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v["tool_calls"][0].get("extra_content").is_none());
+    }
+
+    #[test]
+    fn fragmented_gemini_deltas_keep_the_first_signature() {
+        // Signature rides in on the first delta; later argument fragments
+        // must not clobber it.
+        let d1: DeltaToolCall = serde_json::from_str(
+            r#"{"index":0,"id":"c1","function":{"name":"grep","arguments":"{\"pat"},"extra_content":{"google":{"thought_signature":"S"}}}"#,
+        )
+        .unwrap();
+        let d2: DeltaToolCall = serde_json::from_str(
+            r#"{"index":0,"function":{"arguments":"tern\":\"a\"}"}}"#,
+        )
+        .unwrap();
+        let mut acc = ToolCallAcc::default();
+        acc.absorb(d1);
+        acc.absorb(d2);
+        let tc = acc.finish();
+        assert_eq!(tc.function.arguments, r#"{"pattern":"a"}"#);
+        assert_eq!(
+            tc.extra_content.unwrap()["google"]["thought_signature"],
+            serde_json::json!("S")
+        );
+    }
+
+    #[test]
+    fn synthesized_call_id_uses_stream_index() {
+        // No id in any delta — a stable synthetic id must still be produced.
+        let d: DeltaToolCall = serde_json::from_str(
+            r#"{"index":3,"function":{"name":"list_dir","arguments":"{}"}}"#,
+        )
+        .unwrap();
+        let mut acc = ToolCallAcc::default();
+        acc.absorb(d);
+        assert_eq!(acc.finish().id, "call_3");
+    }
+
+    #[test]
     fn base64_known_vectors() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
@@ -1170,7 +1392,7 @@ mod tests {
     /// error (not hang or silently succeed).
     #[tokio::test]
     async fn probe_fails_without_server() {
-        let c = ChatClient::new("http://127.0.0.1:9/v1", "k", &Default::default(), false, None, "openai")
+        let c = ChatClient::new("http://127.0.0.1:9/v1", "k", &Default::default(), None, "openai")
             .expect("client builds");
         assert!(c.probe_chat("m").await.is_err());
     }
@@ -1185,7 +1407,6 @@ mod tests {
             "https://openrouter.ai/api/v1",
             "sk-definitely-not-a-real-key",
             &Default::default(),
-            false,
             None,
             "openai",
         )
@@ -1213,7 +1434,7 @@ mod tests {
                 "gpt-5",
             ),
         ] {
-            let c = ChatClient::new(base_url, "", &Default::default(), false, None, kind)
+            let c = ChatClient::new(base_url, "", &Default::default(), None, kind)
                 .expect("client builds");
             let reply = c
                 .stream_chat(
