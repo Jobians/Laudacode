@@ -43,11 +43,21 @@ pub enum AgentEvent {
     /// A tool call is starting.
     ToolStart { name: String, summary: String },
     /// A tool finished; `preview` carries a short excerpt of its output.
-    ToolDone { name: String, ok: bool, preview: String },
+    ToolDone {
+        name: String,
+        ok: bool,
+        preview: String,
+    },
     /// A tool mutated files — UI renders these as colored diffs.
-    ToolEdit { name: String, files: Vec<crate::diff::FileDiff> },
+    ToolEdit {
+        name: String,
+        files: Vec<crate::diff::FileDiff>,
+    },
     /// Token usage from the last request.
     Usage(Usage),
+    /// Transient provider condition (rate-limit retry, upstream hiccup) —
+    /// shown to the user, never sent to the model.
+    Notice(String),
     /// The agent wrote a fresh todo list.
     Todo(Vec<tools::TodoItem>),
 }
@@ -63,9 +73,9 @@ pub trait UiSink {
 }
 
 const MAX_TOOL_ROUNDS: usize = 30;
-/// Compact automatically once prompt tokens pass this fraction of a rough
-/// context budget (~128k). Keeps long sessions from silently overflowing.
-const AUTO_COMPACT_AT: u64 = 100_000;
+/// Fallback context window (tokens) when nothing better is configured. The
+/// real threshold is model-aware — see `budget::compact_threshold`.
+const DEFAULT_CTX_WINDOW: u64 = 128_000;
 
 pub struct Agent {
     pub client: ChatClient,
@@ -85,9 +95,21 @@ pub struct Agent {
     turn_seq: u64,
     last_undone: Option<u64>,
     processes: crate::processes::ProcessManager,
+    /// Commands run after each successful file mutation (`[hooks] post_edit`).
+    pub(crate) hooks: crate::config::Hooks,
+    /// Token/cost ceilings from `[limits]`.
+    pub(crate) limits: crate::config::Limits,
+    /// Assumed context window driving the auto-compact threshold.
+    pub(crate) ctx_window: u64,
+    /// Optional structured run log (`[logging]`).
+    pub(crate) logger: crate::logging::Logger,
+    /// Files touched by the action currently executing (drives post-edit
+    /// hooks). Refreshed by `snapshot_for_undo` on every call.
+    last_touched: Vec<PathBuf>,
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: ChatClient,
         model: String,
@@ -95,7 +117,30 @@ impl Agent {
         mode: ApprovalMode,
         permissions: crate::permissions::Permissions,
     ) -> Self {
-        let system = Self::build_system_prompt(&cwd);
+        Self::with_config(
+            client,
+            model,
+            cwd,
+            mode,
+            permissions,
+            &crate::config::Config::default(),
+            DEFAULT_CTX_WINDOW,
+        )
+    }
+
+    /// Full constructor: the REPL passes the real config so hooks, limits and
+    /// the context window are honored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config(
+        client: ChatClient,
+        model: String,
+        cwd: PathBuf,
+        mode: ApprovalMode,
+        permissions: crate::permissions::Permissions,
+        config: &crate::config::Config,
+        ctx_window: u64,
+    ) -> Self {
+        let system = Self::build_system_prompt(&cwd, config);
         Self {
             client,
             model,
@@ -110,7 +155,21 @@ impl Agent {
             turn_seq: 0,
             last_undone: None,
             processes: Default::default(),
+            hooks: config.hooks.clone(),
+            limits: config.limits.clone(),
+            ctx_window: if ctx_window == 0 {
+                DEFAULT_CTX_WINDOW
+            } else {
+                ctx_window
+            },
+            logger: crate::logging::Logger::from_config(&config.logging),
+            last_touched: Vec::new(),
         }
+    }
+
+    /// Estimated session cost so far (USD).
+    pub fn session_cost(&self) -> f64 {
+        crate::budget::estimate_cost(self.tot_usage.0, self.tot_usage.1)
     }
 
     /// Revert file changes from the last `n` distinct agent turns (most recent
@@ -161,11 +220,16 @@ impl Agent {
             let (s, files) = seen[0];
             Ok(format!("reverted {files} file(s) from turn #{s}"))
         } else {
-            Ok(format!("reverted {} turn(s): {}", seen.len(), summary.join(", ")))
+            Ok(format!(
+                "reverted {} turn(s): {}",
+                seen.len(),
+                summary.join(", ")
+            ))
         }
     }
 
-    /// Record the pre-image of every path an action is about to touch.
+    /// Record the pre-image of every path an action is about to touch, and
+    /// remember those paths so post-edit hooks know what changed.
     fn snapshot_for_undo(&mut self, action: &tools::Action) {
         use tools::Action;
         let paths: Vec<PathBuf> = match action {
@@ -176,20 +240,23 @@ impl Agent {
             | Action::WebSearch { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
+            | Action::Git { .. }
             | Action::RunCommand { .. }
             | Action::StartProcess { .. }
             | Action::PollProcess { .. }
             | Action::WriteProcess { .. }
             | Action::StopProcess { .. }
-            | Action::UpdatePlan { .. } => return,
+            | Action::UpdatePlan { .. } => Vec::new(),
             Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
                 match tools::resolve_path_in(&self.cwd, path) {
                     Ok(p) => vec![p],
-                    Err(_) => return,
+                    Err(_) => vec![],
                 }
             }
             Action::ApplyPatch { patch } => {
-                let Ok(hunks) = crate::patch::parse_patch(patch) else { return };
+                let Ok(hunks) = crate::patch::parse_patch(patch) else {
+                    return;
+                };
                 hunks
                     .iter()
                     .filter_map(|h| {
@@ -198,6 +265,9 @@ impl Agent {
                     .collect()
             }
         };
+        // Even when nothing is snapshotted, clear the previous action's list
+        // so hooks never fire against a stale set of files.
+        self.last_touched = paths.clone();
         for p in paths {
             let prev = std::fs::read_to_string(&p).ok();
             self.undo_stack.push((self.turn_seq, p, prev));
@@ -223,12 +293,7 @@ impl Agent {
                 .parameters
                 .get("properties")
                 .and_then(|p| p.as_object())
-                .map(|o| {
-                    o.keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
+                .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
                 .unwrap_or_default();
             s.push_str(&format!(
                 "- {}({}) — {}.\n",
@@ -252,19 +317,34 @@ impl Agent {
         s.push_str("\nSpecialists you can spawn with delegate(tasks:[{agent,task}]):\n");
         for r in crate::agents::all_roles() {
             let tag = if r.read_only { " [read-only]" } else { "" };
-            s.push_str(&format!(
-                "- {} — {}{}\n",
-                r.name, r.description, tag
-            ));
+            s.push_str(&format!("- {} — {}{}\n", r.name, r.description, tag));
         }
         s
     }
 
-    fn build_system_prompt(cwd: &std::path::Path) -> String {
+    fn build_system_prompt(cwd: &std::path::Path, config: &crate::config::Config) -> String {
         let overview = tools::project_overview(cwd);
         let agents_md = load_agents_md(cwd);
         let skills = crate::skills::prompt_block(&crate::skills::discover(cwd));
         let termux = std::env::var("TERMUX_VERSION").is_ok();
+        // Tell the model when edits are auto-verified, so it doesn't re-run
+        // the same checks by hand after every write.
+        let hooks_note = if config.hooks.post_edit.is_empty() {
+            String::new()
+        } else {
+            let cmds = config
+                .hooks
+                .post_edit
+                .iter()
+                .map(|c| format!("  - {c}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\nAfter every successful file edit these commands run automatically \
+                 (their output is appended to the tool result):\n{cmds}\n\
+                 Do not re-run them by hand unless they reported a failure.\n"
+            )
+        };
         format!(
             r#"You are Laudacode, an expert AI coding agent running in the user's terminal.
 You help with software engineering: writing code, explaining, debugging, refactoring, fetching docs from the web, running commands, and orchestrating specialist sub-agents.
@@ -281,7 +361,7 @@ paths or URLs — if an action is blocked, adapt instead of retrying identically
 
 {overview}
 {agents_md}
-{skills}{capabilities}
+{skills}{capabilities}{hooks_note}
 
 Working rules:
 1. Inspect BEFORE editing: grep/glob/list_dir/read_file first; read_file returns numbered lines and pages via offset/limit — never guess contents.
@@ -303,6 +383,7 @@ Working rules:
             agents_md = agents_md,
             skills = skills,
             capabilities = Self::capabilities_block(),
+            hooks_note = hooks_note,
         )
     }
 
@@ -313,7 +394,11 @@ Working rules:
             .iter()
             .map(|m| {
                 let text = m.content.as_deref().unwrap_or("");
-                let args: usize = m.tool_calls.iter().map(|t| t.function.arguments.len()).sum();
+                let args: usize = m
+                    .tool_calls
+                    .iter()
+                    .map(|t| t.function.arguments.len())
+                    .sum();
                 (text.len() + args) as u64 / 4
             })
             .sum()
@@ -331,7 +416,10 @@ Working rules:
             .map(|m| {
                 let body = m.content.clone().unwrap_or_default();
                 match m.role.as_str() {
-                    "tool" => format!("[tool result] {}", body.chars().take(400).collect::<String>()),
+                    "tool" => format!(
+                        "[tool result] {}",
+                        body.chars().take(400).collect::<String>()
+                    ),
                     r => format!("[{r}] {body}"),
                 }
             })
@@ -372,7 +460,9 @@ Working rules:
         };
         // The orchestrator can always call specialists (Plan mode gets the
         // read-only subset via the schema enum).
-        defs.push(crate::agents::delegate_tool_def(self.mode == ApprovalMode::Suggest));
+        defs.push(crate::agents::delegate_tool_def(
+            self.mode == ApprovalMode::Suggest,
+        ));
         defs
     }
 
@@ -385,7 +475,9 @@ Working rules:
         };
         if self.mode == ApprovalMode::Suggest {
             for (name, _) in &tasks {
-                let ro = crate::agents::get(name).map(|s| s.read_only).unwrap_or(false);
+                let ro = crate::agents::get(name)
+                    .map(|s| s.read_only)
+                    .unwrap_or(false);
                 if !ro {
                     return format!(
                         "Blocked: '{name}' can mutate files — switch to BUILD to delegate it."
@@ -404,10 +496,7 @@ Working rules:
             let model = model.clone();
             let cwd = cwd.clone();
             async move {
-                crate::agents::run_sub_agent(
-                    &client, &model, &cwd, mode, &name, &task, sink,
-                )
-                .await
+                crate::agents::run_sub_agent(&client, &model, &cwd, mode, &name, &task, sink).await
             }
         });
         let results = futures_util::future::join_all(futures).await;
@@ -435,7 +524,8 @@ Working rules:
         if images.is_empty() {
             self.messages.push(Message::user(input));
         } else {
-            self.messages.push(Message::user_with_images(input, images.to_vec()));
+            self.messages
+                .push(Message::user_with_images(input, images.to_vec()));
         }
 
         // Identical-call ring for the doom-loop guard: the same tool with
@@ -460,18 +550,41 @@ Working rules:
             }
             let turn: Turn = self
                 .client
-                .stream_chat(&self.model, &req_msgs, &self.toolset_for_mode(), |ev| match ev {
-                    StreamEvent::Content(s) => ui.on_event(AgentEvent::Content(s)),
-                    StreamEvent::Reasoning(s) => ui.on_event(AgentEvent::Reasoning(s)),
-                    StreamEvent::Usage(u) => ui.on_event(AgentEvent::Usage(u)),
-                }, cancel)
+                .stream_chat(
+                    &self.model,
+                    &req_msgs,
+                    &self.toolset_for_mode(),
+                    |ev| match ev {
+                        StreamEvent::Content(s) => ui.on_event(AgentEvent::Content(s)),
+                        StreamEvent::Reasoning(s) => ui.on_event(AgentEvent::Reasoning(s)),
+                        StreamEvent::Usage(u) => ui.on_event(AgentEvent::Usage(u)),
+                        StreamEvent::Notice(s) => ui.on_event(AgentEvent::Notice(s)),
+                    },
+                    cancel,
+                )
                 .await
                 .context("chat completion failed")?;
 
             if let Some(u) = turn.usage {
                 self.last_usage = Some(u);
-                self.tot_usage.0 += u.prompt_tokens;
-                self.tot_usage.1 += u.completion_tokens;
+                self.tot_usage.0 = self.tot_usage.0.saturating_add(u.prompt_tokens);
+                self.tot_usage.1 = self.tot_usage.1.saturating_add(u.completion_tokens);
+                self.logger
+                    .usage(&self.model, self.tot_usage.0, self.tot_usage.1);
+            }
+
+            // Guardrails: refuse to keep spending once a `[limits]` ceiling
+            // is crossed. Checked before the turn is committed so the model
+            // gets one clean explanation instead of a silent cutoff.
+            if let Some(reason) =
+                crate::budget::exceeded(&self.limits, self.tot_usage.0, self.tot_usage.1)
+            {
+                if !turn.content.is_empty() {
+                    self.messages.push(Message::assistant(turn.content));
+                }
+                self.logger
+                    .event("budget_blocked", serde_json::json!({ "reason": reason }));
+                anyhow::bail!("{reason}");
             }
 
             if is_cancelled(cancel) {
@@ -491,22 +604,24 @@ Working rules:
             // Persist assistant intent, then execute each requested tool.
             self.messages.push(Message::assistant_with_tools(
                 turn.tool_calls.clone(),
-                if turn.content.is_empty() { None } else { Some(turn.content) },
+                if turn.content.is_empty() {
+                    None
+                } else {
+                    Some(turn.content)
+                },
             ));
 
             let mut image_attachments = Vec::new();
             for tc in turn.tool_calls {
                 if is_cancelled(cancel) {
-                    self.messages.push(Message::tool_result(&tc.id, "[interrupted by user]"));
+                    self.messages
+                        .push(Message::tool_result(&tc.id, "[interrupted by user]"));
                     anyhow::bail!("interrupted by user");
                 }
                 // Doom-loop guard: 3 identical calls in a row → refuse and
                 // tell the model to change strategy instead of burning
                 // rounds (and tokens) on the same failing action.
-                let key = (
-                    tc.tool_name().to_string(),
-                    tc.function.arguments.clone(),
-                );
+                let key = (tc.tool_name().to_string(), tc.function.arguments.clone());
                 recent_calls.push(key);
                 let n = recent_calls.len();
                 if n >= 3
@@ -526,7 +641,9 @@ Working rules:
                     ));
                     continue;
                 }
-                let result = self.execute_call(&tc, ui, &mut image_attachments, cancel).await;
+                let result = self
+                    .execute_call(&tc, ui, &mut image_attachments, cancel)
+                    .await;
                 self.messages.push(Message::tool_result(&tc.id, result));
             }
             // Finish every tool response before adding user-role vision parts.
@@ -534,21 +651,33 @@ Working rules:
             let has_images = !image_attachments.is_empty();
             self.messages.extend(image_attachments);
 
-            // Auto-compact when the context grows past the threshold. Falls
-            // back to a chars/4 estimate when the provider reports no usage.
+            // Auto-compact when the context grows past the model-aware
+            // threshold (80% of the assumed window). Falls back to a chars/4
+            // estimate when the provider reports no usage.
             let prompt_tokens = self
                 .last_usage
                 .map(|u| u.prompt_tokens)
                 .unwrap_or_else(|| self.estimated_prompt_tokens());
-            if !has_images && prompt_tokens > AUTO_COMPACT_AT && self.messages.len() > 4 {
+            let threshold = crate::budget::compact_threshold(self.ctx_window);
+            if !has_images && prompt_tokens > threshold && self.messages.len() > 4 {
                 let ok = self.compact().await.is_ok();
-                ui.on_event(AgentEvent::ToolDone { name: "compact".into(), ok, preview: String::new() });
+                ui.on_event(AgentEvent::ToolDone {
+                    name: "compact".into(),
+                    ok,
+                    preview: String::new(),
+                });
             }
         }
         anyhow::bail!("agent stopped after {MAX_TOOL_ROUNDS} tool rounds (possible loop)")
     }
 
-    async fn execute_call(&mut self, tc: &ToolCall, ui: &mut dyn UiSink, image_attachments: &mut Vec<Message>, cancel: Option<&std::sync::atomic::AtomicBool>) -> String {
+    async fn execute_call(
+        &mut self,
+        tc: &ToolCall,
+        ui: &mut dyn UiSink,
+        image_attachments: &mut Vec<Message>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> String {
         // Orchestration tool — handled before the regular action pipeline.
         // (tool_name() strips provider namespaces like Gemini's `default_api:`.)
         if tc.tool_name() == "delegate" {
@@ -576,9 +705,9 @@ Working rules:
         // Check the real target too: an innocently named symlink must not
         // bypass a read deny rule or the secrets-file guard.
         if let tools::Action::ViewImage { path } = &action {
-            if let Ok(real) = tools::resolve_path_in(&self.cwd, path).and_then(|p| {
-                std::fs::canonicalize(p).map_err(Into::into)
-            }) {
+            if let Ok(real) = tools::resolve_path_in(&self.cwd, path)
+                .and_then(|p| std::fs::canonicalize(p).map_err(Into::into))
+            {
                 inputs.push(("read", real.to_string_lossy().into_owned()));
                 if let Ok(root) = std::fs::canonicalize(&self.cwd) {
                     if let Ok(relative) = real.strip_prefix(root) {
@@ -605,12 +734,15 @@ Working rules:
             }
         }
         // Secret guard: .env-style files are denied unless explicitly allowed.
-        let secret_hit = inputs.iter().filter(|(t, _)| *t == "read").find_map(|(_, p)| {
-            (self.permissions.resolve("read", p).is_none()
-                && crate::permissions::Permissions::secret_guard(p)
-                    == Some(crate::permissions::Rule::Deny))
-            .then_some(p)
-        });
+        let secret_hit = inputs
+            .iter()
+            .filter(|(t, _)| *t == "read")
+            .find_map(|(_, p)| {
+                (self.permissions.resolve("read", p).is_none()
+                    && crate::permissions::Permissions::secret_guard(p)
+                        == Some(crate::permissions::Rule::Deny))
+                .then_some(p)
+            });
         if let Some(path_input) = secret_hit {
             return format!(
                 "Blocked: '{path_input}' looks like a secrets file (.env*). \
@@ -620,7 +752,14 @@ Working rules:
 
         let name = tc.tool_name().to_string();
         let summary = action.describe();
-        ui.on_event(AgentEvent::ToolStart { name: name.clone(), summary });
+        ui.on_event(AgentEvent::ToolStart {
+            name: name.clone(),
+            summary: summary.clone(),
+        });
+        self.logger.event(
+            "tool_start",
+            serde_json::json!({ "tool": name, "summary": summary }),
+        );
 
         // Approval gate. Permission rules take precedence; otherwise writes
         // outside the workspace stay High and prompt even in FULL AUTO.
@@ -653,7 +792,9 @@ Working rules:
         let result = match &action {
             tools::Action::ViewImage { path } => {
                 if image_attachments.len() >= 4 {
-                    Err(anyhow::anyhow!("at most four images per tool batch; view remaining images next round"))
+                    Err(anyhow::anyhow!(
+                        "at most four images per tool batch; view remaining images next round"
+                    ))
                 } else {
                     crate::images::load_data_uri(&self.cwd, path).map(|uri| {
                         image_attachments.push(Message::user_with_images(
@@ -664,18 +805,45 @@ Working rules:
                     })
                 }
             }
-            tools::Action::StartProcess { command } => self.processes.start(command, &self.cwd).await
+            tools::Action::StartProcess { command } => self
+                .processes
+                .start(command, &self.cwd)
+                .await
                 .map(|id| (format!("started process #{id}: {command}"), vec![])),
-            tools::Action::PollProcess { id } => self.processes.poll(*id).await.map(|s| (s, vec![])),
-            tools::Action::WriteProcess { id, input, eof } => self.processes.send_input(*id, input, *eof).await.map(|s| (s, vec![])),
-            tools::Action::StopProcess { id } => self.processes.stop(*id).await.map(|s| (s, vec![])),
+            tools::Action::PollProcess { id } => {
+                self.processes.poll(*id).await.map(|s| (s, vec![]))
+            }
+            tools::Action::WriteProcess { id, input, eof } => self
+                .processes
+                .send_input(*id, input, *eof)
+                .await
+                .map(|s| (s, vec![])),
+            tools::Action::StopProcess { id } => {
+                self.processes.stop(*id).await.map(|s| (s, vec![]))
+            }
             _ => action.perform_with_diff(&self.cwd, cancel).await,
         };
         match result {
-            Ok((out, files)) => {
+            Ok((mut out, files)) => {
                 // Surface colored diffs for any mutated files first.
                 if !files.is_empty() {
-                    ui.on_event(AgentEvent::ToolEdit { name: name.clone(), files });
+                    ui.on_event(AgentEvent::ToolEdit {
+                        name: name.clone(),
+                        files,
+                    });
+                }
+                // Post-edit hooks: verify the change (format, lint, test) and
+                // feed the verdict straight back to the model.
+                if action.mutates_files() && !self.hooks.post_edit.is_empty() {
+                    let touched: Vec<String> = self
+                        .last_touched
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    let report = self.run_post_edit_hooks(&touched).await;
+                    if !report.is_empty() {
+                        out.push_str(&report);
+                    }
                 }
                 let preview: String = out
                     .lines()
@@ -686,11 +854,17 @@ Working rules:
                     .join(" ⏎ ");
                 // Kept generous — Ctrl+O in the TUI expands this in full.
                 let preview = preview.chars().take(1200).collect::<String>();
-                ui.on_event(AgentEvent::ToolDone { name, ok: true, preview });
+                self.logger.tool(&name, true, &preview);
+                ui.on_event(AgentEvent::ToolDone {
+                    name,
+                    ok: true,
+                    preview,
+                });
                 out
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                self.logger.tool(&name, false, &msg);
                 ui.on_event(AgentEvent::ToolDone {
                     name,
                     ok: false,
@@ -699,6 +873,70 @@ Working rules:
                 format!("Command failed: {msg}")
             }
         }
+    }
+
+    /// Run `[hooks] post_edit` commands after a mutation. Returns a block
+    /// appended to the tool result: each hook's exit code plus captured
+    /// output, so the model can react to a failing formatter or test run.
+    async fn run_post_edit_hooks(&self, touched: &[String]) -> String {
+        if self.hooks.post_edit.is_empty() {
+            return String::new();
+        }
+        let timeout = std::time::Duration::from_secs(self.hooks.post_edit_timeout_secs.max(1));
+        let mut report = String::from("\n[post-edit hooks]");
+        let mut failed = 0usize;
+        for cmd in &self.hooks.post_edit {
+            let run = tools::run_hook(cmd, &self.cwd, touched, timeout).await;
+            match run {
+                Ok(out) => {
+                    // `capture_child` always leads with the exit marker, so
+                    // anything else (including a timeout with no marker) is a
+                    // failure the model should see.
+                    let ok = out.starts_with("[exit: 0]");
+                    if !ok {
+                        failed += 1;
+                    }
+                    let code = out
+                        .lines()
+                        .map(str::trim)
+                        .find_map(|l| l.strip_prefix("[exit: "))
+                        .and_then(|s| s.trim_end_matches(']').trim().parse::<i32>().ok());
+                    // First meaningful line, skipping the exit marker and the
+                    // stdout/stderr section headers capture_child inserts.
+                    let first = out
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| {
+                            !l.is_empty() && !l.starts_with("[exit:") && !l.starts_with("--- ")
+                        })
+                        .unwrap_or("no output");
+                    let mut line = format!("\n$ {cmd} → {first}");
+                    if !ok {
+                        // Never let a silent failure read as a pass.
+                        match code {
+                            Some(c) => line.push_str(&format!(" [FAILED: exit {c}]")),
+                            None => line.push_str(" [FAILED: timed out or no exit status]"),
+                        }
+                    }
+                    report.push_str(&line);
+                }
+                Err(e) => {
+                    failed += 1;
+                    report.push_str(&format!("\n$ {cmd} → error: {e}"));
+                }
+            }
+        }
+        if failed > 0 {
+            report.push_str(&format!(
+                "\n{failed} post-edit hook(s) failed — fix the reported problem before continuing."
+            ));
+        }
+        self.logger.event(
+            "post_edit_hooks",
+            serde_json::json!({ "hooks": self.hooks.post_edit.len(), "failed": failed }),
+        );
+        report.push('\n');
+        report
     }
 }
 
@@ -712,6 +950,25 @@ fn permission_inputs(action: &tools::Action) -> Vec<(&'static str, String)> {
         }
         Action::Grep { pattern, .. } => vec![("read", pattern.clone())],
         Action::Glob { pattern, .. } => vec![("read", pattern.clone())],
+        Action::Git {
+            subcommand,
+            path,
+            rev,
+            ..
+        } => {
+            // Git reads are gated like bash so a deny rule on `git` still
+            // applies, but they never mutate anything.
+            let mut input = format!("git {subcommand}");
+            if let Some(r) = rev {
+                input.push(' ');
+                input.push_str(r);
+            }
+            let mut out = vec![("bash", input)];
+            if let Some(p) = path {
+                out.push(("read", p.clone()));
+            }
+            out
+        }
         Action::FetchUrl { url } => vec![("webfetch", url.clone())],
         Action::WebSearch { query, .. } => vec![("webfetch", query.clone())],
         Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
@@ -721,10 +978,7 @@ fn permission_inputs(action: &tools::Action) -> Vec<(&'static str, String)> {
             let mut out = Vec::new();
             if let Ok(hunks) = crate::patch::parse_patch(patch) {
                 for h in hunks {
-                    out.push((
-                        "edit",
-                        h.classify_path().to_string_lossy().into_owned(),
-                    ));
+                    out.push(("edit", h.classify_path().to_string_lossy().into_owned()));
                 }
             }
             out
@@ -789,7 +1043,8 @@ fn load_agents_md(cwd: &std::path::Path) -> String {
     }
 }
 
-fn chrono_today() -> String {    let now = std::time::SystemTime::now()
+fn chrono_today() -> String {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
@@ -814,7 +1069,10 @@ mod tests {
 
     #[test]
     fn system_prompt_describes_every_tool_and_specialist() {
-        let prompt = Agent::build_system_prompt(std::path::Path::new("."));
+        let prompt = Agent::build_system_prompt(
+            std::path::Path::new("."),
+            &crate::config::Config::default(),
+        );
         // Every registered tool is documented with its parameters.
         for td in tools::tool_defs() {
             assert!(
@@ -834,7 +1092,10 @@ mod tests {
         // Key operational knowledge stays in the prompt.
         assert!(prompt.contains("*** Begin Patch"));
         assert!(prompt.contains("update_plan"));
-        assert!(!prompt.contains("PLAN mode is active"), "plan note is per-request only");
+        assert!(
+            !prompt.contains("PLAN mode is active"),
+            "plan note is per-request only"
+        );
     }
 
     #[test]
@@ -866,9 +1127,120 @@ mod tests {
     #[test]
     fn mode_parsing_accepts_aliases() {
         assert_eq!(ApprovalMode::parse("yolo"), Some(ApprovalMode::FullAuto));
-        assert_eq!(ApprovalMode::parse("auto_edit"), Some(ApprovalMode::AutoEdit));
+        assert_eq!(
+            ApprovalMode::parse("auto_edit"),
+            Some(ApprovalMode::AutoEdit)
+        );
         assert_eq!(ApprovalMode::parse("ASK"), Some(ApprovalMode::Suggest));
         assert_eq!(ApprovalMode::parse("bogus"), None);
+    }
+
+    fn test_agent(cfg: &crate::config::Config) -> Agent {
+        use crate::api::ChatClient;
+        let client = ChatClient::new(
+            "http://localhost:0/v1",
+            "",
+            &Default::default(),
+            None,
+            "openai",
+        )
+        .expect("client");
+        Agent::with_config(
+            client,
+            "test-model".into(),
+            std::env::temp_dir(),
+            ApprovalMode::FullAuto,
+            crate::permissions::Permissions::default(),
+            cfg,
+            128_000,
+        )
+    }
+
+    #[test]
+    fn post_edit_hooks_run_and_report_failures() {
+        let mut cfg = crate::config::Config::default();
+        cfg.hooks.post_edit = vec![
+            "echo lint-ran-on $LAUDACODE_CHANGED_FILES".into(),
+            "exit 3".into(),
+        ];
+        cfg.hooks.post_edit_timeout_secs = 30;
+        let agent = test_agent(&cfg);
+
+        // Hooks spawn a real child process, so the test runtime needs IO.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = rt.block_on(agent.run_post_edit_hooks(&["src/a.rs".to_string()]));
+        // The touched files reach the hook through the environment.
+        assert!(report.contains("lint-ran-on src/a.rs"), "{report}");
+        // Only the `exit 3` hook counts as a failure — the passing one must
+        // not be counted just because it succeeded.
+        assert!(report.contains("1 post-edit hook(s) failed"), "{report}");
+        assert!(report.contains("[FAILED: exit 3]"), "{report}");
+        // Exactly one hook is marked failed, and the silent one is not
+        // mislabelled as a pass.
+        assert_eq!(report.matches("[FAILED").count(), 1, "{report}");
+        assert!(!report.contains("→ ok"), "{report}");
+
+        // A hook that hangs is a failure too, not a silent success.
+        let mut slow = crate::config::Config::default();
+        slow.hooks.post_edit = vec!["sleep 5".into()];
+        slow.hooks.post_edit_timeout_secs = 1;
+        let slow_agent = test_agent(&slow);
+        let report = rt.block_on(slow_agent.run_post_edit_hooks(&["src/a.rs".to_string()]));
+        assert!(report.contains("1 post-edit hook(s) failed"), "{report}");
+        assert!(report.contains("timed out"), "{report}");
+    }
+
+    #[test]
+    fn no_hooks_produces_no_report() {
+        let agent = test_agent(&crate::config::Config::default());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = rt.block_on(agent.run_post_edit_hooks(&["src/a.rs".to_string()]));
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn agent_carries_budget_limits_and_context_window() {
+        let mut cfg = crate::config::Config::default();
+        cfg.limits.max_tokens = Some(50_000);
+        let agent = test_agent(&cfg);
+        assert!(crate::budget::exceeded(&agent.limits, 60_000, 0).is_some());
+        // Context window drives the model-aware compact threshold.
+        assert_eq!(crate::budget::compact_threshold(agent.ctx_window), 102_400);
+        // No usage yet → no cost.
+        assert_eq!(agent.session_cost(), 0.0);
+    }
+
+    #[test]
+    fn mutating_actions_are_flagged_for_hooks() {
+        use tools::Action;
+        assert!(Action::WriteFile {
+            path: "a".into(),
+            content: "b".into()
+        }
+        .mutates_files());
+        assert!(Action::EditFile {
+            path: "a".into(),
+            old: "x".into(),
+            new: "y".into()
+        }
+        .mutates_files());
+        assert!(Action::ApplyPatch { patch: "p".into() }.mutates_files());
+        assert!(!Action::ReadFile {
+            path: "a".into(),
+            offset: None,
+            limit: None
+        }
+        .mutates_files());
+        assert!(!Action::RunCommand {
+            command: "ls".into()
+        }
+        .mutates_files());
     }
 
     #[test]
@@ -890,8 +1262,14 @@ mod tests {
         std::fs::write(dir.join("src/exists.rs"), "original\n").unwrap();
         std::fs::write(dir.join("src/doomed.rs"), "bye\n").unwrap();
 
-        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), None, "openai")
-            .expect("client");
+        let client = ChatClient::new(
+            "http://localhost:0/v1",
+            "",
+            &Default::default(),
+            None,
+            "openai",
+        )
+        .expect("client");
         let mut agent = Agent::new(
             client,
             String::new(),
@@ -922,16 +1300,28 @@ mod tests {
             "delete should apply"
         );
 
-        assert_eq!(std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(), "changed\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(),
+            "changed\n"
+        );
         assert!(dir.join("src/new_file.rs").exists());
         assert!(!dir.join("src/doomed.rs").exists());
 
         // Undo reverts all three.
         let msg = agent.undo_turns(1).unwrap();
         assert!(msg.contains("reverted 3 file(s)"), "{msg}");
-        assert_eq!(std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(), "original\n");
-        assert!(!dir.join("src/new_file.rs").exists(), "created file removed");
-        assert_eq!(std::fs::read_to_string(dir.join("src/doomed.rs")).unwrap(), "bye\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/exists.rs")).unwrap(),
+            "original\n"
+        );
+        assert!(
+            !dir.join("src/new_file.rs").exists(),
+            "created file removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/doomed.rs")).unwrap(),
+            "bye\n"
+        );
 
         // Second undo of the same turn is refused.
         assert!(agent.undo_turns(1).is_err());
@@ -946,8 +1336,14 @@ mod tests {
         std::fs::write(dir.join("src/a.rs"), "v0\n").unwrap();
         std::fs::write(dir.join("src/b.rs"), "v0\n").unwrap();
 
-        let client = ChatClient::new("http://localhost:0/v1", "", &Default::default(), None, "openai")
-            .expect("client");
+        let client = ChatClient::new(
+            "http://localhost:0/v1",
+            "",
+            &Default::default(),
+            None,
+            "openai",
+        )
+        .expect("client");
         let mut agent = Agent::new(
             client,
             String::new(),
@@ -971,20 +1367,38 @@ mod tests {
             new: "v1".into(),
         }));
 
-        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "v1\n");
-        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "v1\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/a.rs")).unwrap(),
+            "v1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/b.rs")).unwrap(),
+            "v1\n"
+        );
 
         // /undo 1 reverts only the most recent turn (b.rs).
         let msg = agent.undo_turns(1).unwrap();
         assert!(msg.contains("turn #"), "{msg}");
-        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "v0\n");
-        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "v1\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/b.rs")).unwrap(),
+            "v0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/a.rs")).unwrap(),
+            "v1\n"
+        );
 
         // /undo 1 reverts the remaining turn (a.rs).
         let msg2 = agent.undo_turns(1).unwrap();
         assert!(msg2.contains("turn #"), "{msg2}");
-        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "v0\n");
-        assert_eq!(std::fs::read_to_string(dir.join("src/b.rs")).unwrap(), "v0\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/a.rs")).unwrap(),
+            "v0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/b.rs")).unwrap(),
+            "v0\n"
+        );
 
         // Stack exhausted.
         assert!(agent.undo_turns(1).is_err());
@@ -994,7 +1408,9 @@ mod tests {
     impl Agent {
         /// Sync helper for tests — runs the action ignoring diffs.
         fn perform_with_diff_blocking(&mut self, action: &tools::Action) -> anyhow::Result<String> {
-            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
             rt.block_on(async { self.perform(action).await })
         }
 

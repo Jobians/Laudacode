@@ -8,25 +8,29 @@ pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 pub fn load_data_uri(cwd: &Path, path: &str) -> Result<String> {
     let path = crate::tools::resolve_path_in(cwd, path)?;
     // Check metadata before open so directories and special files are rejected.
-    let metadata = std::fs::metadata(&path)
-        .with_context(|| format!("inspecting image {}", path.display()))?;
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("inspecting image {}", path.display()))?;
     if !metadata.is_file() {
         bail!("image must be a regular file: {}", path.display());
     }
     if metadata.len() > MAX_IMAGE_BYTES {
         bail!("image too large ({} bytes, limit 8 MiB)", metadata.len());
     }
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("opening image {}", path.display()))?;
+    let file =
+        std::fs::File::open(&path).with_context(|| format!("opening image {}", path.display()))?;
     let mut bytes = Vec::new();
-    file.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)
+    file.take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("reading image {}", path.display()))?;
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
         bail!("image too large (limit 8 MiB)");
     }
     // Sniff signatures rather than trusting a renamed text file's extension.
     let mime = mime_type(&bytes)?;
-    Ok(format!("data:{mime};base64,{}", crate::api::base64_encode(&bytes)))
+    Ok(format!(
+        "data:{mime};base64,{}",
+        crate::api::base64_encode(&bytes)
+    ))
 }
 
 fn mime_type(bytes: &[u8]) -> Result<&'static str> {

@@ -1,13 +1,20 @@
 use crossterm::event::{
     self, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame,
 };
 use std::time::{Duration, Instant};
@@ -52,25 +59,439 @@ impl Mode {
     }
 }
 
-/// Brand banner — braille-art LaudaCode mascot with the wordmark, version
-/// and tagline embedded in the right-hand columns.
-pub const BANNER: &str = concat!(
-    "⠀⠀⠀⠀⠀⠀⣠⣤⣤⣤⣤⣤⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
-    "⡀⠀⠀⠀⠀⢰⡿⠋⠁⠀⠀⠈⠉⠙⠻⣷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
-    "⠇⠀⠀⠀⢀⣿⠇⠈⢀⣴⣶⡾⠿⠿⠿⢿⣿⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
-    "⠃⠀⣀⣀⣸⡿⠀⠀⢸⣿⣇⠀⠀⠀⠀⠀⠀⠙⣷⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n",
-    "⠇⣾⡟⠛⣿⡇⠀⠀⢸⣿⣿⣷⣤⣤⣤⣤⣶⣶⣿⠇⠀⠀⠀⠀⠀⠀⠀⣀⠀⠀\n",
-    "⢅⣿⠀⢀⣿⡇⠀⠀⠀⠻⢿⣿⣿⣿⣿⣿⠿⣿⡏⠀⠀⠀⠀⢴⣶⣶⣿⣿⣿⣆\n",
-    "⣺⣿⠀⢸⣿⡇⠀⠀⠀⠀⠀⠈⠉⠁⠀⠀⠀⣿⡇⣀⣠⣴⣾⣮⣝⠿⠿⠿⣻⡟\n",
-    "⢺⣿⠀⠘⣿⡇⠀⠀⠀⠀⠀⠀⠀⣠⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠉⠀\n",
-    "⠼⣿⠀⠀⣿⡇⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⠉ ⠀⠀⠀* LaudaCode *⠀\n",
-    "⠅⠻⣷⣶⣿⣇⠀⠀⠀⢠⣼⣿⣿⣿⣿⣿⣿⣿⣛⣛⣻⠉⠁⠀⠀         v",
-    env!("CARGO_PKG_VERSION"),
-    "⠀\n",
-    "⡂⠀⠀⠀⢸⣿⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀AI coding agent, pure Rust\n",
-    "⠀⠀⠀⠀⢸⣿⣀⣀⣀⣼⡿⢿⣿⣿⣿⣿⣿⡿⣿⣿⡿⠀  ---------------------------⠀⠀⠀⠀⠀⠀⠀⠀\n",
-    "⠀⠀⠀⠀⠙⠛⠛⠛⠋⠁⠀⠙⠻⠿⠟⠋⠑⠛⠋⠀⠀",
-);
+/// Which palette slot a run of logo text paints with. Resolved against the
+/// live theme at draw time, so `/theme` recolors the logo like everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ink {
+    /// The per-row theme gradient — the logo's structural body.
+    Body,
+    /// Primary accent: faces, cursors, the wordmark itself.
+    Glow,
+    /// Secondary accent: small details that should read as a highlight.
+    Accent,
+    /// Box borders and rules — structural, never shouty.
+    Rule,
+    /// Muted text: prompts, paths, dim labels.
+    Faint,
+}
+
+/// One styled run of logo text.
+#[derive(Debug, Clone, Copy)]
+pub struct Seg(pub &'static str, pub Ink);
+
+impl Seg {
+    pub const fn body(s: &'static str) -> Self {
+        Seg(s, Ink::Body)
+    }
+    pub const fn glow(s: &'static str) -> Self {
+        Seg(s, Ink::Glow)
+    }
+    pub const fn accent(s: &'static str) -> Self {
+        Seg(s, Ink::Accent)
+    }
+    pub const fn rule(s: &'static str) -> Self {
+        Seg(s, Ink::Rule)
+    }
+    pub const fn faint(s: &'static str) -> Self {
+        Seg(s, Ink::Faint)
+    }
+}
+
+/// One logo variant: named rows of styled runs plus the width it needs.
+#[derive(Debug, Clone, Copy)]
+pub struct Art {
+    pub name: &'static str,
+    pub rows: &'static [&'static [Seg]],
+}
+
+/// Every logo variant. One is picked at random per display, so the banner
+/// changes when you restart (or press Ctrl+B) instead of being wallpaper.
+pub const LOGOS: &[Art] = &[
+    Art {
+        name: "wordmark",
+        rows: &[
+            &[Seg::glow(
+                "█      ██   █   █ ████   ██    ████  ███  ████  █████",
+            )],
+            &[Seg::glow(
+                "█     █████ █   █ █   █ █████ █     █   █ █   █ █    ",
+            )],
+            &[Seg::glow(
+                "█     █   █ █   █ █   █ █   █ █     █   █ █   █ ████ ",
+            )],
+            &[Seg::glow(
+                "█     █   █ █   █ █   █ █   █ █     █   █ █   █ █    ",
+            )],
+            &[Seg::glow(
+                "█████ █████  ███  ████  █████  ████  ███  ████  █████",
+            )],
+        ],
+    },
+    Art {
+        name: "terminal",
+        rows: &[
+            &[Seg::rule(" ╭─────────────────────────────────╮")],
+            &[
+                Seg::rule(" │"),
+                Seg::glow(" ⎈"),
+                Seg::rule("  laudacode   "),
+                Seg::glow(concat!("v", env!("CARGO_PKG_VERSION"))),
+                Seg::rule("           │"),
+            ],
+            &[Seg::rule(" │                                 │")],
+            &[
+                Seg::faint(" │   ╱▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"),
+                Seg::rule("  │"),
+            ],
+            &[
+                Seg::rule(" │  ╱"),
+                Seg::glow("◕ ═══ ◕"),
+                Seg::rule(" ╲   "),
+                Seg::faint("▄▄▄▄▄▄▄▄▄"),
+                Seg::rule("         │"),
+            ],
+            &[
+                Seg::rule(" │ ╱"),
+                Seg::glow("‿ ═══ ‿"),
+                Seg::rule(" ╲  █"),
+                Seg::accent("▪"),
+                Seg::rule("███               │"),
+            ],
+            &[
+                Seg::rule(" │╲"),
+                Seg::glow(" ᗜ═══════▟"),
+                Seg::rule(" ╱  █"),
+                Seg::accent("▪"),
+                Seg::rule("███             │"),
+            ],
+            &[
+                Seg::faint(" │ ╲▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁╱   "),
+                Seg::rule("▀▀▀▀▀▀▀▀▀  │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::faint(" ❯ _"),
+                Seg::glow(" █"),
+                Seg::rule("                           │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::faint(" ❯ cargo test"),
+                Seg::glow(" █"),
+                Seg::rule("                  │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::faint(" ❯ "),
+                Seg::glow("▊"),
+                Seg::rule("                             │"),
+            ],
+            &[Seg::rule(" ╰─────────────────────────────────╯")],
+        ],
+    },
+    Art {
+        name: "cat",
+        rows: &[
+            &[Seg::rule(" ╭                             ╮")],
+            &[
+                Seg::rule(" │"),
+                Seg::glow("   ▄▀▀▄     ▄▀▀▄"),
+                Seg::rule("             │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::glow("  █    █   █    █"),
+                Seg::rule("            │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::glow("  █ "),
+                Seg::accent("◕◕"),
+                Seg::glow(" █   █ "),
+                Seg::accent("◕◕"),
+                Seg::glow(" █"),
+                Seg::rule("            │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::glow("  █    █   █    █"),
+                Seg::rule("            │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::glow("   █▄▄▄█▄▄▄▄▄▄█▄▄▄"),
+                Seg::rule("           │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::faint("      ╱        ╲"),
+                Seg::rule("             │"),
+            ],
+            &[Seg::rule(" ╰                             ╯")],
+        ],
+    },
+    Art {
+        name: "gem",
+        rows: &[
+            &[Seg::rule(" ╭                         ╮")],
+            &[
+                Seg::rule(" │"),
+                Seg::body("       ╱╲"),
+                Seg::rule("                │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::body("      ╱  ╲"),
+                Seg::faint("   ✦"),
+                Seg::rule("           │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::body("     ╱    ╲"),
+                Seg::rule("              │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::body("    ╱╱╱╱╱╱╲"),
+                Seg::rule("              │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::accent("   ░░░░░░░░░"),
+                Seg::rule("             │"),
+            ],
+            &[
+                Seg::rule(" │"),
+                Seg::accent("  ░░░░░░░░░░░"),
+                Seg::rule("            │"),
+            ],
+            &[Seg::rule(" ╰                         ╯")],
+        ],
+    },
+    Art {
+        name: "rocket",
+        rows: &[
+            &[Seg::faint("        "), Seg::glow("▲")],
+            &[Seg::faint("       "), Seg::glow("▲▲▲")],
+            &[Seg::faint("      "), Seg::glow("▲▲▲▲▲")],
+            &[Seg::faint("     "), Seg::rule("╱▔▔▔▔▔▔╲")],
+            &[Seg::faint("    "), Seg::rule("┌───────┐")],
+            &[
+                Seg::faint("    "),
+                Seg::rule("│"),
+                Seg::accent(" ▟███▙ "),
+                Seg::rule("│"),
+            ],
+            &[
+                Seg::faint("    "),
+                Seg::rule("│"),
+                Seg::accent(" ▜███▛ "),
+                Seg::rule("│"),
+            ],
+            &[Seg::faint("    "), Seg::rule("└───┬───┘")],
+            &[
+                Seg::faint("     "),
+                Seg::glow("╽"),
+                Seg::accent("▐█▌"),
+                Seg::glow("╿"),
+                Seg::faint("  ✧"),
+            ],
+            &[
+                Seg::faint("      "),
+                Seg::glow("▲"),
+                Seg::accent(" █ "),
+                Seg::glow("▲"),
+                Seg::faint("  ✦"),
+            ],
+            &[Seg::faint("       "), Seg::accent("▀▀▀")],
+        ],
+    },
+    Art {
+        name: "mount",
+        rows: &[
+            &[Seg::faint("          "), Seg::glow("☀")],
+            &[Seg::glow("   ▂▃▄▅▆▇")],
+            &[Seg::glow("  ▃▄▅▆▇█")],
+            &[Seg::glow(" ▄▅▆▇█▄▅▆▇")],
+            &[Seg::glow("▅▆▇█▄▅▆▇█▄▅▆")],
+            &[Seg::faint("▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁")],
+            &[Seg::rule(" ❯ "), Seg::glow("▊")],
+        ],
+    },
+    Art {
+        name: "circuit",
+        rows: &[
+            &[
+                Seg::glow(" ●"),
+                Seg::rule("───"),
+                Seg::glow("●"),
+                Seg::rule("────●"),
+            ],
+            &[Seg::rule(" │"), Seg::faint("        │      ╭─╯")],
+            &[Seg::rule(" │   ┌────┤      │")],
+            &[Seg::glow(" ●───┘"), Seg::faint("           ●")],
+            &[Seg::rule(" │")],
+            &[Seg::rule(" ╰──●"), Seg::faint("─────")],
+            &[Seg::faint("       ╰────●──╮")],
+            &[Seg::accent("            ╰─●")],
+            &[Seg::faint("               ╰──── ⚡")],
+        ],
+    },
+];
+
+/// Tallest variant — the banner band is sized to this and shorter logos are
+/// centered inside it.
+const BANNER_ROWS: u16 = 12;
+
+/// Pick a logo at random from the variants that fit `width`. Re-rolled on
+/// every display, never per frame, so the banner doesn't flicker.
+pub fn pick_logo(width: u16) -> &'static Art {
+    let fits: Vec<&Art> = LOGOS
+        .iter()
+        .filter(|a| composed_width(a) <= width)
+        .collect();
+    let pool: Vec<&Art> = if fits.is_empty() {
+        // Too narrow even for the identity block: take the most compact logo
+        // and let the paragraph clip rather than showing an empty band.
+        LOGOS
+            .iter()
+            .min_by_key(|a| composed_width(a))
+            .into_iter()
+            .collect()
+    } else {
+        fits
+    };
+    let n = next_rand() as usize % pool.len();
+    pool[n]
+}
+
+/// A fresh OS-seeded `u64` — enough randomness to re-roll a banner, with no
+/// PRNG state to carry around.
+fn next_rand() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::hash::RandomState::new().build_hasher().finish()
+}
+
+/// The identity block pinned to the right of whichever logo is showing, so
+/// the name/version/tagline ride along with all of them — not just one.
+const INFO: &[(&str, Ink)] = &[
+    ("LaudaCode", Ink::Glow),
+    ("v", Ink::Accent),
+    ("AI coding agent", Ink::Faint),
+];
+
+/// Spaces between the right edge of a logo and the identity block.
+const INFO_GUTTER: u16 = 3;
+
+/// Widest line in the identity block (the version is filled in at compile
+/// time, so it is measured with a placeholder of the same shape).
+fn info_width() -> u16 {
+    INFO.iter()
+        .map(|(text, _)| {
+            if *text == "v" {
+                ("v".to_string() + env!("CARGO_PKG_VERSION"))
+                    .chars()
+                    .count()
+            } else {
+                text.chars().count()
+            }
+        })
+        .max()
+        .unwrap_or(0) as u16
+}
+
+/// The identity block with the real version spliced in.
+fn info_segments() -> Vec<(&'static str, Ink)> {
+    INFO.iter()
+        .map(|(text, ink)| {
+            if *text == "v" {
+                (concat!("v", env!("CARGO_PKG_VERSION")), *ink)
+            } else {
+                (*text, *ink)
+            }
+        })
+        .collect()
+}
+
+/// A logo's own width — every row padded out to this so the identity block
+/// starts in the same column on every line.
+fn art_width(art: &Art) -> u16 {
+    art.rows
+        .iter()
+        .map(|r| r.iter().map(|s| s.0.chars().count()).sum::<usize>())
+        .max()
+        .unwrap_or(0) as u16
+}
+
+/// Total width a logo needs once the identity block is included. This — not
+/// the art width — is what decides whether the logo fits the terminal.
+pub fn composed_width(art: &Art) -> u16 {
+    art_width(art) + INFO_GUTTER + info_width()
+}
+
+/// True when at least one logo (art + identity block) fits in `width`.
+/// Below this, callers should fall back to the one-line identity header.
+pub fn any_logo_fits(width: u16) -> bool {
+    LOGOS.iter().any(|a| composed_width(a) <= width)
+}
+
+/// Render a logo with the identity block beside it, vertically centered in
+/// the band.
+pub fn banner_lines(art: &Art) -> Vec<Line<'static>> {
+    let t = crate::theme::get();
+    let grad = crate::theme::banner_gradient(art.rows.len());
+    let aw = art_width(art);
+    let info = info_segments();
+    let top = (BANNER_ROWS as usize).saturating_sub(art.rows.len()) / 2;
+    let info_top = top + art.rows.len().saturating_sub(info.len()) / 2;
+
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(BANNER_ROWS as usize);
+    for y in 0..BANNER_ROWS as usize {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        // Logo, left-anchored and padded to the art width.
+        if y >= top && y < top + art.rows.len() {
+            let i = y - top;
+            let body = grad.get(i).copied().unwrap_or(t.banner[0]);
+            let row = art.rows[i];
+            let used: usize = row.iter().map(|s| s.0.chars().count()).sum();
+            for Seg(text, ink) in row {
+                spans.push(Span::styled(
+                    *text,
+                    Style::default()
+                        .fg(match ink {
+                            Ink::Body => body,
+                            Ink::Glow => t.accent,
+                            Ink::Accent => t.accent2,
+                            Ink::Rule => t.border,
+                            Ink::Faint => t.dim,
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::raw(" ".repeat((aw as usize).saturating_sub(used))));
+        }
+        // Identity block, right of the gutter. The gutter goes on *every*
+        // block row, not just the first, or the lines sit ragged.
+        if y >= info_top && y < info_top + info.len() {
+            spans.push(Span::raw(" ".repeat(INFO_GUTTER as usize)));
+            let (text, ink) = info[y - info_top];
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .fg(match ink {
+                        Ink::Body => t.text,
+                        Ink::Glow => t.accent,
+                        Ink::Accent => t.accent2,
+                        Ink::Rule => t.border,
+                        Ink::Faint => t.dim,
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
 
 /// Banner gradient derived from the active theme's three color stops.
 fn banner_colors() -> Vec<Color> {
@@ -104,7 +525,10 @@ fn panel(title: Option<Line<'static>>, accent: Option<Color>) -> Block<'static> 
 /// Selected-row style: a filled "pill" instead of the old bold-only row.
 fn selection_style() -> Style {
     let t = crate::theme::get();
-    Style::default().bg(t.surface).fg(t.surface_fg).add_modifier(Modifier::BOLD)
+    Style::default()
+        .bg(t.surface)
+        .fg(t.surface_fg)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// A key-hint chip: the key cap is accent-colored + bold, the label dim.
@@ -112,7 +536,13 @@ fn selection_style() -> Style {
 fn key_hint(key: &str, label: &str) -> Vec<Span<'static>> {
     let t = crate::theme::get();
     vec![
-        Span::styled(format!(" {key} "), Style::default().bg(t.surface).fg(t.hint_key).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .bg(t.surface)
+                .fg(t.hint_key)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!(" {label}"), Style::default().fg(t.hint_text)),
     ]
 }
@@ -137,8 +567,9 @@ fn meter(pct: u64, slots: usize) -> Vec<Span<'static>> {
     ]
 }
 
-/// Total header height: 13 braille-art rows (branding is embedded in the art).
-const HEADER_HEIGHT: u16 = 13;
+/// Total header height: the tallest logo (12 rows), so the band never resizes
+/// as the logo changes.
+pub const HEADER_HEIGHT: u16 = BANNER_ROWS;
 /// Height of the slim one-line wordmark header used on short/narrow windows.
 const HEADER_COMPACT: u16 = 1;
 
@@ -148,10 +579,20 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Reasoning(String),
-    ToolCall { name: String, summary: String },
-    ToolResult { name: String, ok: bool, preview: String },
+    ToolCall {
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        name: String,
+        ok: bool,
+        preview: String,
+    },
     /// A tool mutated files — rendered as colored unified diffs.
-    ToolDiff { name: String, files: Vec<crate::diff::FileDiff> },
+    ToolDiff {
+        name: String,
+        files: Vec<crate::diff::FileDiff>,
+    },
     Info(String),
     Error(String),
 }
@@ -257,7 +698,11 @@ impl ProviderSetup {
         Self {
             kind: SetupKind::Add,
             name: key.to_string(),
-            base_url: if need_base_url { "https://".to_string() } else { base_url.to_string() },
+            base_url: if need_base_url {
+                "https://".to_string()
+            } else {
+                base_url.to_string()
+            },
             api_key: None,
             need_base_url,
         }
@@ -287,7 +732,12 @@ pub struct InputModal {
 
 impl InputModal {
     pub fn new(title: impl Into<String>, hint: impl Into<String>, mask: bool) -> Self {
-        Self { title: title.into(), hint: hint.into(), value: String::new(), mask }
+        Self {
+            title: title.into(),
+            hint: hint.into(),
+            value: String::new(),
+            mask,
+        }
     }
 
     /// What the input row displays (masked or plain) plus the caret.
@@ -366,9 +816,14 @@ pub struct Tui {
     last_ctrl_c: Option<Instant>,
     /// Brand banner pinned above the transcript (Ctrl+B toggles).
     show_banner: bool,
+    /// Logo currently in the banner. Picked once per display and re-rolled on
+    /// toggle — never per frame, or it would flicker.
+    logo: &'static Art,
     /// Render cache: wrapped lines for already-processed entries. Only the
     /// growing tail (the streaming entry) is re-wrapped each frame.
     cache_width: u16,
+    /// Width of the last draw — decides which logos fit the banner band.
+    last_width: u16,
     cached_lines: Vec<Line<'static>>,
     processed_entries: usize,
     /// Per-processed-entry: (content length when wrapped, line count).
@@ -427,7 +882,14 @@ pub struct Dash {
 }
 
 impl Dash {
-    pub fn set_session(&mut self, id: &str, model: &str, provider: &str, cwd: &str, messages: usize) {
+    pub fn set_session(
+        &mut self,
+        id: &str,
+        model: &str,
+        provider: &str,
+        cwd: &str,
+        messages: usize,
+    ) {
         self.session_id = shorten_id(id);
         self.model = model.to_string();
         self.provider = provider.to_string();
@@ -476,7 +938,10 @@ fn shorten_id(id: &str) -> String {
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
     ("/model", "pick a model from the live list"),
-    ("/reasoning", "thinking depth: normal · low · medium · high · max (auto-detected)"),
+    (
+        "/reasoning",
+        "thinking depth: normal · low · medium · high · max (auto-detected)",
+    ),
     ("/approvals", "switch approval mode (plan/build/full-auto)"),
     ("/provider", "menu: add · use · edit · list"),
     ("/compact", "summarize history to free context"),
@@ -485,6 +950,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/export", "save transcript as markdown"),
     ("/resume", "resume a previous session by id"),
     ("/session", "rename · search · list · delete sessions"),
+    ("/checkpoint", "snapshot the conversation as a branch point"),
+    ("/checkpoints", "list this session's checkpoints"),
+    ("/branch", "branch a new session from a checkpoint"),
     ("/image", "attach an image to your next message"),
     ("/status", "provider · model · session info"),
     ("/diff", "show uncommitted git changes"),
@@ -495,7 +963,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "exit Laudacode (alias of /quit)"),
     ("/theme", "switch color theme"),
     ("/effect", "ambient effects (petals, rain, …)"),
-    ("/skills", "search & pick a skill (staged into the composer)"),
+    (
+        "/skills",
+        "search & pick a skill (staged into the composer)",
+    ),
 ];
 
 /// Indices into `SLASH_COMMANDS` whose name starts with `query`
@@ -553,7 +1024,9 @@ impl Tui {
             overlay_scroll: 0,
             last_ctrl_c: None,
             show_banner: true,
+            logo: pick_logo(80),
             cache_width: 0,
+            last_width: 80,
             cached_lines: Vec::new(),
             processed_entries: 0,
             entry_state: Vec::new(),
@@ -801,9 +1274,23 @@ impl Tui {
         desired.clamp(MIN_H, cap)
     }
 
-    /// Toggle the pinned brand banner (Ctrl+B).
+    /// Toggle the pinned brand banner (Ctrl+B). Re-rolls the logo so the
+    /// button doubles as "show me another one".
     pub fn toggle_banner(&mut self) {
         self.show_banner = !self.show_banner;
+        if self.show_banner {
+            self.logo = pick_logo(self.last_width);
+        }
+    }
+
+    /// The logo the banner is currently showing.
+    pub fn banner_logo(&self) -> &'static Art {
+        self.logo
+    }
+
+    /// Re-roll the banner logo (e.g. after a terminal resize).
+    pub fn reroll_banner(&mut self) {
+        self.logo = pick_logo(self.last_width);
     }
 
     pub fn banner_visible(&self) -> bool {
@@ -822,7 +1309,12 @@ impl Tui {
             Some(i) => {
                 let at_start = i == 0 || self.input[..i].ends_with(char::is_whitespace);
                 let no_space_after = !self.input[i + 1..].contains(char::is_whitespace);
-                at_start && no_space_after && self.files.iter().any(|f| Self::at_matches(&self.files_query(), f))
+                at_start
+                    && no_space_after
+                    && self
+                        .files
+                        .iter()
+                        .any(|f| Self::at_matches(&self.files_query(), f))
             }
         }
     }
@@ -854,7 +1346,12 @@ impl Tui {
                 let lower = f.to_lowercase();
                 let depth = f.matches('/').count();
                 // Rank: filename-prefix hits first, shallower paths next.
-                let rank = if lower.rsplit('/').next().unwrap_or("").starts_with(&q) && !q.is_empty() { 0 } else { 1 };
+                let rank =
+                    if lower.rsplit('/').next().unwrap_or("").starts_with(&q) && !q.is_empty() {
+                        0
+                    } else {
+                        1
+                    };
                 (rank * 10_000 + depth, i)
             })
             .collect();
@@ -912,11 +1409,15 @@ impl Tui {
     }
 
     fn cursor_left(&mut self) {
-        if self.cursor > 0 { self.cursor -= 1; }
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
     }
 
     fn cursor_right(&mut self) {
-        if self.cursor < self.input.chars().count() { self.cursor += 1; }
+        if self.cursor < self.input.chars().count() {
+            self.cursor += 1;
+        }
     }
 
     /// Insert `c` at the caret and advance past it.
@@ -941,7 +1442,9 @@ impl Tui {
 
     /// Delete the char immediately before the caret.
     fn backspace_at(&mut self) -> bool {
-        if self.cursor == 0 || self.input.is_empty() { return false; }
+        if self.cursor == 0 || self.input.is_empty() {
+            return false;
+        }
         let byte_at = Self::char_byte_offset(&self.input, self.cursor);
         let prev_byte = Self::char_byte_offset(&self.input, self.cursor - 1);
         let tail: String = self.input[byte_at..].to_string();
@@ -971,7 +1474,11 @@ impl Tui {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         let m = msg.into();
-        if m.is_empty() { self.status = None } else { self.status = Some((m, Instant::now())) }
+        if m.is_empty() {
+            self.status = None
+        } else {
+            self.status = Some((m, Instant::now()))
+        }
     }
 
     pub fn clear_status(&mut self) {
@@ -979,7 +1486,12 @@ impl Tui {
     }
 
     pub fn open_picker(&mut self, title: impl Into<String>, items: Vec<String>) {
-        self.picker = Some(Picker { title: title.into(), items, selected: 0, filter: String::new() });
+        self.picker = Some(Picker {
+            title: title.into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
     }
 
     pub fn open_approval(&mut self, detail: String) {
@@ -1065,7 +1577,10 @@ impl Tui {
             Entry::ToolResult { name, preview, .. } => name.len() + preview.len(),
             Entry::ToolDiff { name, files } => {
                 name.len()
-                    + files.iter().map(|f| f.path.len() + f.lines.iter().map(|l| l.text.len()).sum::<usize>()).sum::<usize>()
+                    + files
+                        .iter()
+                        .map(|f| f.path.len() + f.lines.iter().map(|l| l.text.len()).sum::<usize>())
+                        .sum::<usize>()
             }
         }
     }
@@ -1075,7 +1590,9 @@ impl Tui {
         match e {
             Entry::User(t) => vec![Line::from(Span::styled(
                 format!("{} {}", "›", t),
-                Style::default().fg(crate::theme::get().user).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::theme::get().user)
+                    .add_modifier(Modifier::BOLD),
             ))],
             Entry::Assistant(t) => {
                 crate::markdown::render_markdown(t, width.saturating_sub(2) as usize)
@@ -1085,7 +1602,9 @@ impl Tui {
                 .map(|l| {
                     Line::from(Span::styled(
                         l,
-                        Style::default().fg(crate::theme::get().dim).add_modifier(Modifier::ITALIC),
+                        Style::default()
+                            .fg(crate::theme::get().dim)
+                            .add_modifier(Modifier::ITALIC),
                     ))
                 })
                 .collect(),
@@ -1093,9 +1612,14 @@ impl Tui {
                 Span::styled("● ", Style::default().fg(crate::theme::get().accent2)),
                 Span::styled(
                     name.clone(),
-                    Style::default().fg(crate::theme::get().accent2).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(crate::theme::get().accent2)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {summary}"), Style::default().fg(crate::theme::get().gray)),
+                Span::styled(
+                    format!(" {summary}"),
+                    Style::default().fg(crate::theme::get().gray),
+                ),
             ])],
             Entry::ToolResult { name, ok, preview } => {
                 let t = crate::theme::get();
@@ -1117,10 +1641,17 @@ impl Tui {
                 let total_add: usize = files.iter().map(|f| f.added).sum();
                 let total_del: usize = files.iter().map(|f| f.removed).sum();
                 let mut lines = vec![Line::from(vec![
-                    Span::styled("✎ ", Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "✎ ",
+                        Style::default()
+                            .fg(crate::theme::get().accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         name.clone(),
-                        Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(crate::theme::get().accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("  +{total_add} −{total_del}"),
@@ -1135,7 +1666,9 @@ impl Tui {
                         Span::styled("┌─ ", Style::default().fg(crate::theme::get().accent2)),
                         Span::styled(
                             format!("{} (+{} −{})", f.path, f.added, f.removed),
-                            Style::default().fg(crate::theme::get().accent2).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(crate::theme::get().accent2)
+                                .add_modifier(Modifier::BOLD),
                         ),
                     ]));
                     // Syntax-aware diff rows: token colors from the file's
@@ -1152,9 +1685,9 @@ impl Tui {
                         let bar_style = match dl.kind {
                             LineKind::Add => Style::default().fg(crate::theme::get().success),
                             LineKind::Del => Style::default().fg(crate::theme::get().error),
-                            LineKind::Meta => {
-                                Style::default().fg(crate::theme::get().heading).add_modifier(Modifier::ITALIC)
-                            }
+                            LineKind::Meta => Style::default()
+                                .fg(crate::theme::get().heading)
+                                .add_modifier(Modifier::ITALIC),
                             LineKind::Ctx => Style::default().fg(crate::theme::get().dim),
                         };
                         // Meta lines (@@ headers) stay plain; code gets tokens.
@@ -1162,7 +1695,9 @@ impl Tui {
                         let content: Vec<Span<'static>> = match dl.kind {
                             LineKind::Meta => vec![Span::styled(
                                 dl.text.clone(),
-                                Style::default().fg(crate::theme::get().heading).add_modifier(Modifier::ITALIC),
+                                Style::default()
+                                    .fg(crate::theme::get().heading)
+                                    .add_modifier(Modifier::ITALIC),
                             )],
                             _ => {
                                 let base = match tint {
@@ -1170,7 +1705,11 @@ impl Tui {
                                     None => Style::default(),
                                 };
                                 let mut spans: Vec<Span<'static>> = Vec::new();
-                                if let Some(rest) = dl.text.strip_prefix('+').or_else(|| dl.text.strip_prefix('-')) {
+                                if let Some(rest) = dl
+                                    .text
+                                    .strip_prefix('+')
+                                    .or_else(|| dl.text.strip_prefix('-'))
+                                {
                                     let sign_color = match dl.kind {
                                         LineKind::Add => crate::theme::get().success,
                                         _ => crate::theme::get().error,
@@ -1179,30 +1718,57 @@ impl Tui {
                                         dl.text[..1].to_string(),
                                         base.fg(sign_color).add_modifier(Modifier::BOLD),
                                     ));
-                                    spans.extend(crate::syntax::highlight_line(rest, lang, &mut syn_state, base));
+                                    spans.extend(crate::syntax::highlight_line(
+                                        rest,
+                                        lang,
+                                        &mut syn_state,
+                                        base,
+                                    ));
                                 } else {
-                                    spans.extend(crate::syntax::highlight_line(&dl.text, lang, &mut syn_state, base));
+                                    spans.extend(crate::syntax::highlight_line(
+                                        &dl.text,
+                                        lang,
+                                        &mut syn_state,
+                                        base,
+                                    ));
                                 }
                                 spans
                             }
                         };
-                        for seg in crate::markdown::wrap_styled(&content, width.saturating_sub(4) as usize) {
+                        for seg in
+                            crate::markdown::wrap_styled(&content, width.saturating_sub(4) as usize)
+                        {
                             let mut row = vec![Span::styled(bar.to_string(), bar_style)];
                             row.extend(seg.spans);
                             lines.push(Line::from(row));
                         }
                     }
-                    lines.push(Line::from(Span::styled("└─", Style::default().fg(crate::theme::get().accent2))));
+                    lines.push(Line::from(Span::styled(
+                        "└─",
+                        Style::default().fg(crate::theme::get().accent2),
+                    )));
                 }
                 lines
             }
             Entry::Info(t) => t
                 .lines()
-                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(crate::theme::get().heading))))
+                .map(|l| {
+                    Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(crate::theme::get().heading),
+                    ))
+                })
                 .collect(),
             Entry::Error(t) => wrap_text(t, width.saturating_sub(2) as usize)
                 .into_iter()
-                .map(|l| Line::from(Span::styled(l, Style::default().fg(crate::theme::get().error).add_modifier(Modifier::BOLD))))
+                .map(|l| {
+                    Line::from(Span::styled(
+                        l,
+                        Style::default()
+                            .fg(crate::theme::get().error)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                })
                 .collect(),
         }
     }
@@ -1262,7 +1828,7 @@ impl Tui {
     }
 
     /// Height of the header to reserve — 0 = none.
-    ///   full 13-row art  → wide AND tall enough
+    ///   full 11-row art  → wide AND tall enough
     ///   compact 1-line   → some width but little height (mobile portrait)
     pub fn header_height(total_w: u16, total_h: u16, show_banner: bool) -> u16 {
         if !show_banner {
@@ -1310,7 +1876,10 @@ impl Tui {
         // Each chip costs " KEY label" plus the 2-col separator between chips.
         let mut used = 1usize;
         for (key, label) in CHIPS {
-            let cost = key.chars().count() + label.chars().count() + 3 + if out.is_empty() { 0 } else { 2 };
+            let cost = key.chars().count()
+                + label.chars().count()
+                + 3
+                + if out.is_empty() { 0 } else { 2 };
             if used + cost > w {
                 break;
             }
@@ -1352,7 +1921,11 @@ impl Tui {
         if p.is_empty() {
             return "/".to_string();
         }
-        p.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
+        p.rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(p)
+            .to_string()
     }
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
@@ -1386,11 +1959,8 @@ impl Tui {
         // keep the classic single-column layout pixel-for-pixel.
         let (area, dash_area) = match Self::dash_width(area.width, area.height) {
             Some(dw) => {
-                let cols = Layout::horizontal([
-                    Constraint::Min(40),
-                    Constraint::Length(dw),
-                ])
-                .split(area);
+                let cols =
+                    Layout::horizontal([Constraint::Min(40), Constraint::Length(dw)]).split(area);
                 (cols[0], Some(cols[1]))
             }
             None => (area, None),
@@ -1399,7 +1969,7 @@ impl Tui {
         // The composer grows with the draft instead of clipping long prompts.
         let comp_h = self.composer_height(area.width, area.height);
 
-        // Adaptive header: full 13-row banner when there's room; a slim
+        // Adaptive header: full 11-row banner when there's room; a slim
         // one-line wordmark when the window is short/narrow; nothing on tiny
         // screens. This keeps the transcript front-and-center on mobile.
         let header_rows = Self::header_height(area.width, area.height, self.show_banner);
@@ -1463,17 +2033,13 @@ impl Tui {
                 // Tapping the slim header cycles the mode (same as Tab).
                 self.tap_targets.push((h, Tap::ModeChip));
             } else {
-                let grad = banner_colors();
-                let banner_lines: Vec<Line> = BANNER
-                    .lines()
-                    .zip(grad.iter())
-                    .map(|(row, color)| {
-                        Line::from(Span::styled(
-                            row.to_string(),
-                            Style::default().fg(*color).add_modifier(Modifier::BOLD),
-                        ))
-                    })
-                    .collect();
+                // A wider window may unlock a roomier logo; a narrower one must
+                // fall back so the art never clips mid-glyph.
+                if self.last_width != area.width {
+                    self.last_width = area.width;
+                    self.reroll_banner();
+                }
+                let banner_lines = banner_lines(self.logo);
                 f.render_widget(Paragraph::new(banner_lines), h);
                 // Ambient particles live inside the banner band only.
                 self.fx.set_area(h.width, h.height);
@@ -1523,7 +2089,12 @@ impl Tui {
                 format!(" ↑ {} lines · esc release ", self.scroll),
                 Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
             );
-            let r = Rect::new(transcript_area.x, transcript_area.y, transcript_area.width, 1);
+            let r = Rect::new(
+                transcript_area.x,
+                transcript_area.y,
+                transcript_area.width,
+                1,
+            );
             let p = Paragraph::new(Line::from(hint)).alignment(ratatui::layout::Alignment::Right);
             f.render_widget(p, r);
             // Tapping it jumps back to the live tail.
@@ -1540,7 +2111,9 @@ impl Tui {
         let text: Vec<Line> = if self.input.is_empty() && !cursor_ok {
             vec![Line::from(Span::styled(
                 "waiting for approval — y / a / n",
-                Style::default().fg(crate::theme::get().dim).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(crate::theme::get().dim)
+                    .add_modifier(Modifier::ITALIC),
             ))]
         } else if self.input.is_empty() {
             vec![Line::from(Span::styled(
@@ -1571,7 +2144,10 @@ impl Tui {
             Line::from(vec![
                 Span::styled(" ", Style::default()),
                 mode_pill,
-                Span::styled(format!("  {cwd} "), Style::default().fg(crate::theme::get().dim)),
+                Span::styled(
+                    format!("  {cwd} "),
+                    Style::default().fg(crate::theme::get().dim),
+                ),
             ])
         };
         let composer = Paragraph::new(text)
@@ -1586,7 +2162,8 @@ impl Tui {
             let col = UnicodeWidthStr::width(last) as u16;
             let row = composer_area.y
                 + 1
-                + ((segs.len().saturating_sub(1)) as u16).min(composer_area.height.saturating_sub(2));
+                + ((segs.len().saturating_sub(1)) as u16)
+                    .min(composer_area.height.saturating_sub(2));
             let x = composer_area.x + 1 + col.min(composer_area.width.saturating_sub(2));
             f.set_cursor_position((x, row));
         }
@@ -1617,15 +2194,15 @@ impl Tui {
             // Each chip is independently tappable.
             let cw = key_w + label_w;
             if cw > 0 && start + cw <= hints_area.x + hints_area.width {
-                self.tap_targets.push((
-                    Rect::new(start, hints_area.y, cw, 1),
-                    Tap::HintChip(i),
-                ));
+                self.tap_targets
+                    .push((Rect::new(start, hints_area.y, cw, 1), Tap::HintChip(i)));
             }
             chip_x += cw;
             hint_spans.push(Span::styled(
                 (*key).to_string(),
-                Style::default().fg(crate::theme::get().hint_key).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::theme::get().hint_key)
+                    .add_modifier(Modifier::BOLD),
             ));
             if !label.is_empty() {
                 hint_spans.push(Span::styled(
@@ -1643,11 +2220,8 @@ impl Tui {
 
         // Footer: brand + mode chip + activity on the left; context meter +
         // subtitle right-aligned in a second column.
-        let cols = Layout::horizontal([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
-        ])
-        .split(footer_area);
+        let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(footer_area);
         let brand = " LaudaCode ";
         let mode_chip = format!(" {} ", self.mode.label());
         let brand_w = UnicodeWidthStr::width(brand) as u16;
@@ -1662,10 +2236,18 @@ impl Tui {
             Tap::ModeChip,
         ));
         let mut spans = vec![
-            Span::styled(brand, Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                brand,
+                Style::default()
+                    .fg(crate::theme::get().accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 mode_chip,
-                Style::default().bg(self.mode.color()).fg(crate::theme::get().overlay).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(self.mode.color())
+                    .fg(crate::theme::get().overlay)
+                    .add_modifier(Modifier::BOLD),
             ),
         ];
         if self.busy {
@@ -1673,7 +2255,9 @@ impl Tui {
             let secs = self.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             spans.push(Span::styled(
                 format!(" {glyph} {} (esc · {secs}s)", self.busy_label),
-                Style::default().fg(crate::theme::get().warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(crate::theme::get().warning)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         if let Some((msg, at)) = &self.status {
@@ -1711,7 +2295,10 @@ impl Tui {
             let left = 100 - pct;
             let tail = format!(" {:>3}% ", left);
             let label = if slots >= 6 { "ctx " } else { "" };
-            meter_spans.push(Span::styled(label, Style::default().fg(crate::theme::get().dim)));
+            meter_spans.push(Span::styled(
+                label,
+                Style::default().fg(crate::theme::get().dim),
+            ));
             meter_spans.extend(meter(pct, slots));
             meter_spans.push(Span::styled(
                 tail,
@@ -1750,18 +2337,29 @@ impl Tui {
             parts.push(format!("{} tok", Self::fmt_tokens(self.dash.tot_tokens)));
         }
         if self.dash.plan_total > 0 {
-            parts.push(format!("plan {}/{}", self.dash.plan_done, self.dash.plan_total));
+            parts.push(format!(
+                "plan {}/{}",
+                self.dash.plan_done, self.dash.plan_total
+            ));
         }
         let joined = parts.join(" · ");
         let mut spans = vec![
             Span::styled(" ", Style::default().fg(crate::theme::get().accent)),
-            Span::styled("LaudaCode", Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "LaudaCode",
+                Style::default()
+                    .fg(crate::theme::get().accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("  ", Style::default().fg(crate::theme::get().dim)),
         ];
         let budget = w.saturating_sub(14);
         if budget >= 4 {
             let shown = Self::truncate_to(joined, budget);
-            spans.push(Span::styled(shown, Style::default().fg(crate::theme::get().gray)));
+            spans.push(Span::styled(
+                shown,
+                Style::default().fg(crate::theme::get().gray),
+            ));
         }
         spans
     }
@@ -1774,7 +2372,9 @@ impl Tui {
                 Span::styled("◆ ", Style::default().fg(crate::theme::get().accent)),
                 Span::styled(
                     "laudacode",
-                    Style::default().fg(crate::theme::get().accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(crate::theme::get().accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ])),
@@ -1791,7 +2391,10 @@ impl Tui {
         let row = |label: &str, value: String, vcolor: Color| -> Line<'static> {
             Line::from(vec![
                 Span::styled(format!(" {:<9}", label), Style::default().fg(theme.dim)),
-                Span::styled(Self::truncate_to(value, w.saturating_sub(10)), Style::default().fg(vcolor)),
+                Span::styled(
+                    Self::truncate_to(value, w.saturating_sub(10)),
+                    Style::default().fg(vcolor),
+                ),
             ])
         };
         v.push(row("session", self.dash.session_id.clone(), theme.text));
@@ -1804,7 +2407,11 @@ impl Tui {
             format!(" {}", "─".repeat(w.saturating_sub(1))),
             Style::default().fg(theme.rule),
         )));
-        v.push(row("mode", self.mode.label().to_string(), self.mode.color()));
+        v.push(row(
+            "mode",
+            self.mode.label().to_string(),
+            self.mode.color(),
+        ));
         v.push(Line::from(Span::raw(String::new())));
 
         // Context usage block.
@@ -1825,17 +2432,26 @@ impl Tui {
         v.push(Line::from(bar));
         v.push(Line::from(vec![
             Span::styled(format!(" {:<9}", "in"), Style::default().fg(theme.dim)),
-            Span::styled(Self::fmt_tokens(self.dash.prompt_tokens), Style::default().fg(theme.gray)),
+            Span::styled(
+                Self::fmt_tokens(self.dash.prompt_tokens),
+                Style::default().fg(theme.gray),
+            ),
             Span::styled(" tok", Style::default().fg(theme.dim)),
         ]));
         v.push(Line::from(vec![
             Span::styled(format!(" {:<9}", "out"), Style::default().fg(theme.dim)),
-            Span::styled(Self::fmt_tokens(self.dash.completion_tokens), Style::default().fg(theme.gray)),
+            Span::styled(
+                Self::fmt_tokens(self.dash.completion_tokens),
+                Style::default().fg(theme.gray),
+            ),
             Span::styled(" tok", Style::default().fg(theme.dim)),
         ]));
         v.push(Line::from(vec![
             Span::styled(format!(" {:<9}", "total"), Style::default().fg(theme.dim)),
-            Span::styled(Self::fmt_tokens(self.dash.tot_tokens), Style::default().fg(theme.accent2)),
+            Span::styled(
+                Self::fmt_tokens(self.dash.tot_tokens),
+                Style::default().fg(theme.accent2),
+            ),
             Span::styled(" tok", Style::default().fg(theme.dim)),
         ]));
 
@@ -1864,56 +2480,60 @@ impl Tui {
             }
             hints.push(Span::styled(
                 (*key).to_string(),
-                Style::default().fg(theme.hint_key).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.hint_key)
+                    .add_modifier(Modifier::BOLD),
             ));
-            hints.push(Span::styled(format!(" {label}"), Style::default().fg(theme.hint_text)));
+            hints.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(theme.hint_text),
+            ));
         }
         v.push(Line::from(hints));
         v
     }
 
-/// Clamp a display string to `w` cells (unicode-width aware-ish).
-fn truncate_to(s: String, w: usize) -> String {
-    if UnicodeWidthStr::width(s.as_str()) <= w {
-        return s;
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
-        if used + cw > w.saturating_sub(1) {
-            out.push('…');
-            break;
+    /// Clamp a display string to `w` cells (unicode-width aware-ish).
+    fn truncate_to(s: String, w: usize) -> String {
+        if UnicodeWidthStr::width(s.as_str()) <= w {
+            return s;
         }
-        out.push(ch);
-        used += cw;
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in s.chars() {
+            let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+            if used + cw > w.saturating_sub(1) {
+                out.push('…');
+                break;
+            }
+            out.push(ch);
+            used += cw;
+        }
+        out
     }
-    out
-}
 
-/// 45231 → "45.2k"; keeps dashboards tight.
-fn fmt_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}m", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
+    /// 45231 → "45.2k"; keeps dashboards tight.
+    fn fmt_tokens(n: u64) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}m", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
     }
-}
 
-/// 3725 → "1h02m", 59 → "0m59s".
-fn fmt_elapsed(secs: u64) -> String {
-    if secs >= 3600 {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}m{:02}s", secs / 60, secs % 60)
+    /// 3725 → "1h02m", 59 → "0m59s".
+    fn fmt_elapsed(secs: u64) -> String {
+        if secs >= 3600 {
+            format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+        } else {
+            format!("{}m{:02}s", secs / 60, secs % 60)
+        }
     }
-}
 
-/// Fixed dashboard column width on wide terminals.
-const DASH_WIDTH: u16 = 40;
-
+    /// Fixed dashboard column width on wide terminals.
+    const DASH_WIDTH: u16 = 40;
 
     /// Centered approval dialog: detail + y/a/n options.
     fn draw_approval_modal(&mut self, f: &mut Frame, area: Rect, detail: &str) {
@@ -1928,10 +2548,17 @@ const DASH_WIDTH: u16 = 40;
         };
         let theme = crate::theme::get();
         let mut lines: Vec<Line> = vec![Line::from(vec![
-            Span::styled("⚠ ", Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "⚠ ",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 "Allow this action?",
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             ),
         ])];
         for l in wrapped {
@@ -1939,9 +2566,14 @@ const DASH_WIDTH: u16 = 40;
         }
         lines.push(Line::from(String::new()));
         let mut keys: Vec<Span> = Vec::new();
-        for (i, (key, label)) in [("y", "yes"), ("a", "always"), ("n", "no"), ("esc", "cancel")]
-            .iter()
-            .enumerate()
+        for (i, (key, label)) in [
+            ("y", "yes"),
+            ("a", "always"),
+            ("n", "no"),
+            ("esc", "cancel"),
+        ]
+        .iter()
+        .enumerate()
         {
             if i > 0 {
                 keys.push(Span::styled("   ", Style::default()));
@@ -1954,7 +2586,9 @@ const DASH_WIDTH: u16 = 40;
                 Span::styled("⚠ ", Style::default().fg(theme.warning)),
                 Span::styled(
                     "approval",
-                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ])),
@@ -1972,7 +2606,12 @@ const DASH_WIDTH: u16 = 40;
         // the x offsets instead of pixel-locating rendered spans.
         let mut x = rect.x + 1;
         let inner_w = rect.width.saturating_sub(2);
-        for (key, label) in [("y", "yes"), ("a", "always"), ("n", "no"), ("esc", "cancel")] {
+        for (key, label) in [
+            ("y", "yes"),
+            ("a", "always"),
+            ("n", "no"),
+            ("esc", "cancel"),
+        ] {
             let w = (key.chars().count() + label.chars().count() + 3) as u16;
             if x + w > rect.x + 1 + inner_w {
                 break;
@@ -2003,18 +2642,29 @@ const DASH_WIDTH: u16 = 40;
         let theme = crate::theme::get();
         let mut lines: Vec<Line> = Vec::new();
         for l in &hint_lines {
-            lines.push(Line::from(Span::styled(l.clone(), Style::default().fg(theme.gray))));
+            lines.push(Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(theme.gray),
+            )));
         }
         lines.push(Line::from(String::new()));
         // The field itself: a filled row so it reads as an input box.
         let field_w = (width.saturating_sub(4)) as usize;
         let mut shown = m.display();
         if shown.chars().count() >= field_w {
-            shown = shown.chars().skip(shown.chars().count() - field_w).collect();
+            shown = shown
+                .chars()
+                .skip(shown.chars().count() - field_w)
+                .collect();
         }
         let pad = field_w.saturating_sub(shown.chars().count());
         lines.push(Line::from(vec![
-            Span::styled(format!(" {shown}"), Style::default().fg(theme.accent2).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {shown}"),
+                Style::default()
+                    .fg(theme.accent2)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" ".repeat(pad), Style::default().fg(theme.surface)),
         ]));
         lines.push(Line::from(String::new()));
@@ -2031,7 +2681,9 @@ const DASH_WIDTH: u16 = 40;
                 Span::styled("✎ ", Style::default().fg(theme.accent)),
                 Span::styled(
                     m.title.clone(),
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ])),
@@ -2073,7 +2725,9 @@ const DASH_WIDTH: u16 = 40;
                 Span::styled("⚙ ", Style::default().fg(theme.accent2)),
                 Span::styled(
                     "tool output",
-                    Style::default().fg(theme.accent2).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent2)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("  esc/ctrl+o close ", Style::default().fg(theme.dim)),
             ])),
@@ -2088,7 +2742,12 @@ const DASH_WIDTH: u16 = 40;
                 Entry::ToolCall { name, summary } => {
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.accent2)),
-                        Span::styled(name.to_string(), Style::default().fg(theme.accent2).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            name.to_string(),
+                            Style::default()
+                                .fg(theme.accent2)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(format!(" {summary}"), Style::default().fg(theme.gray)),
                     ]));
                 }
@@ -2155,7 +2814,12 @@ const DASH_WIDTH: u16 = 40;
         if y < area.y {
             return; // not enough room above the composer
         }
-        let rect = Rect { x: area.x, y, width, height };
+        let rect = Rect {
+            x: area.x,
+            y,
+            width,
+            height,
+        };
         // Remember the geometry so a tap on a row can complete it.
         self.last_slash_popup = Some(rect);
         // Popups float over the transcript: their tap region is registered
@@ -2174,9 +2838,20 @@ const DASH_WIDTH: u16 = 40;
                 let entry = &entries[i];
                 let (cmd, desc) = (&entry.cmd, &entry.desc);
                 let selected = i == matches[sel];
-                let name_color = if entry.custom.is_some() { theme.success } else { theme.accent2 };
+                let name_color = if entry.custom.is_some() {
+                    theme.success
+                } else {
+                    theme.accent2
+                };
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", if selected { sel_style } else { Style::default() }),
+                    Span::styled(
+                        " ",
+                        if selected {
+                            sel_style
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(
                         format!("{:<14}", cmd),
                         if selected {
@@ -2187,14 +2862,21 @@ const DASH_WIDTH: u16 = 40;
                     ),
                     Span::styled(
                         desc.to_string(),
-                        if selected { sel_style } else { Style::default().fg(theme.dim) },
+                        if selected {
+                            sel_style
+                        } else {
+                            Style::default().fg(theme.dim)
+                        },
                     ),
                 ]))
             })
             .collect();
 
         let block = panel(
-            Some(Line::from(Span::styled(" commands ", Style::default().fg(theme.dim)))),
+            Some(Line::from(Span::styled(
+                " commands ",
+                Style::default().fg(theme.dim),
+            ))),
             Some(theme.border),
         );
         f.render_widget(Clear, rect);
@@ -2221,7 +2903,12 @@ const DASH_WIDTH: u16 = 40;
         if y < area.y {
             return;
         }
-        let rect = Rect { x: area.x, y, width, height };
+        let rect = Rect {
+            x: area.x,
+            y,
+            width,
+            height,
+        };
         // Remember the geometry so a tap on a row can complete it.
         self.last_at_popup = Some(rect);
         // Registered last (topmost) for the same reason as the slash popup.
@@ -2241,13 +2928,23 @@ const DASH_WIDTH: u16 = 40;
                     Style::default().fg(theme.success)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", if selected { sel_style } else { Style::default() }),
+                    Span::styled(
+                        " ",
+                        if selected {
+                            sel_style
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(format!("@{path}"), style),
                 ]))
             })
             .collect();
         let block = panel(
-            Some(Line::from(Span::styled(" files ", Style::default().fg(theme.success)))),
+            Some(Line::from(Span::styled(
+                " files ",
+                Style::default().fg(theme.success),
+            ))),
             Some(theme.success),
         );
         f.render_widget(Clear, rect);
@@ -2262,7 +2959,9 @@ const DASH_WIDTH: u16 = 40;
                 Span::styled("◇ ", Style::default().fg(theme.accent)),
                 Span::styled(
                     p.title.clone(),
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ])),
@@ -2305,7 +3004,14 @@ const DASH_WIDTH: u16 = 40;
                     Style::default().fg(theme.text)
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(" ", if *i == p.selected { sel_style } else { Style::default() }),
+                    Span::styled(
+                        " ",
+                        if *i == p.selected {
+                            sel_style
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(p.items[*i].clone(), style),
                 ]))
             })
@@ -2364,7 +3070,10 @@ const DASH_WIDTH: u16 = 40;
         if self.overlay {
             return match key.code {
                 KeyCode::Esc | KeyCode::Char('o') => {
-                    if key.code == KeyCode::Char('o') && !key.modifiers.contains(KeyModifiers::CONTROL) && !self.input.is_empty() {
+                    if key.code == KeyCode::Char('o')
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !self.input.is_empty()
+                    {
                         Action::None
                     } else {
                         self.overlay = false;
@@ -2430,8 +3139,11 @@ const DASH_WIDTH: u16 = 40;
                         return Action::None;
                     }
                     KeyCode::Enter
-                        if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                            && self.input.trim_end() != self.files[matches[self.at_sel.min(matches.len() - 1)]] =>
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                            && self.input.trim_end()
+                                != self.files[matches[self.at_sel.min(matches.len() - 1)]] =>
                     {
                         self.complete_at();
                         return Action::None;
@@ -2463,7 +3175,9 @@ const DASH_WIDTH: u16 = 40;
                     // Enter completes unless the input already IS the
                     // highlighted command — then fall through and submit.
                     KeyCode::Enter
-                        if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
                             && self.input.trim_end() != cmd =>
                     {
                         self.complete_slash();
@@ -2476,13 +3190,19 @@ const DASH_WIDTH: u16 = 40;
 
         match key.code {
             KeyCode::Enter
-                if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
                 let input = self.input.trim().to_string();
                 self.input.clear();
                 self.cursor_home();
                 self.record_history(&input);
-                if input.is_empty() { Action::None } else { Action::Submit(input) }
+                if input.is_empty() {
+                    Action::None
+                } else {
+                    Action::Submit(input)
+                }
             }
             // Shift+Enter / Alt+Enter insert a newline instead of submitting.
             KeyCode::Enter => {
@@ -2565,8 +3285,14 @@ const DASH_WIDTH: u16 = 40;
                 self.cursor_end();
                 Action::None
             }
-            KeyCode::PageUp if self.scrollable() => { self.page_up(20); Action::None }
-            KeyCode::PageDown => { self.page_down(20); Action::None }
+            KeyCode::PageUp if self.scrollable() => {
+                self.page_up(20);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.page_down(20);
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -2749,8 +3475,7 @@ const DASH_WIDTH: u16 = 40;
                 if !matches.is_empty() {
                     let visible = matches.len().min(POPUP_MAX_VISIBLE);
                     let sel = self.slash_sel.min(matches.len() - 1);
-                    let start =
-                        sel.saturating_sub(visible / 2).min(matches.len() - visible);
+                    let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
                     if let Some(off) = Self::popup_row_offset(pos, rect, visible) {
                         self.slash_sel = start + off;
                         self.complete_slash();
@@ -2765,8 +3490,7 @@ const DASH_WIDTH: u16 = 40;
                 if !matches.is_empty() {
                     let visible = matches.len().min(POPUP_MAX_VISIBLE);
                     let sel = self.at_sel.min(matches.len() - 1);
-                    let start =
-                        sel.saturating_sub(visible / 2).min(matches.len() - visible);
+                    let start = sel.saturating_sub(visible / 2).min(matches.len() - visible);
                     if let Some(off) = Self::popup_row_offset(pos, rect, visible) {
                         self.at_sel = start + off;
                         self.complete_at();
@@ -2813,7 +3537,10 @@ const DASH_WIDTH: u16 = 40;
             if ri >= max || start + ri >= idxs.len() {
                 return None;
             }
-            (p.items[idxs[start + ri]].clone(), p.title.clone().to_lowercase())
+            (
+                p.items[idxs[start + ri]].clone(),
+                p.title.clone().to_lowercase(),
+            )
         };
         self.picker = None;
         Some(Action::OpenSlash(format!("{}:{}", tapped.1, tapped.0)))
@@ -2859,22 +3586,36 @@ const DASH_WIDTH: u16 = 40;
             let idxs = p.filtered();
             let pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
             match key.code {
-                KeyCode::Esc => { self.picker = None; }
+                KeyCode::Esc => {
+                    self.picker = None;
+                }
                 KeyCode::Up => {
-                    if pos > 0 { p.selected = idxs[pos - 1]; }
-                    else if let Some(last) = idxs.last() { p.selected = *last; }
+                    if pos > 0 {
+                        p.selected = idxs[pos - 1];
+                    } else if let Some(last) = idxs.last() {
+                        p.selected = *last;
+                    }
                 }
                 KeyCode::Down => {
-                    if pos + 1 < idxs.len() { p.selected = idxs[pos + 1]; }
-                    else if let Some(first) = idxs.first() { p.selected = *first; }
+                    if pos + 1 < idxs.len() {
+                        p.selected = idxs[pos + 1];
+                    } else if let Some(first) = idxs.first() {
+                        p.selected = *first;
+                    }
                 }
-                KeyCode::Backspace => { p.filter.pop(); }
+                KeyCode::Backspace => {
+                    p.filter.pop();
+                }
                 KeyCode::Char(c) => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        if c == 'c' { self.picker = None; }
+                        if c == 'c' {
+                            self.picker = None;
+                        }
                     } else {
                         p.filter.push(c);
-                        if let Some(first) = p.filtered().first() { p.selected = *first; }
+                        if let Some(first) = p.filtered().first() {
+                            p.selected = *first;
+                        }
                     }
                 }
                 KeyCode::Enter => {
@@ -2946,8 +3687,9 @@ where
     // Seed once; afterwards the subtitle is live state that provider/model
     // switches update (see ProviderSwitched handling in repl).
     tui.subtitle = subtitle;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-        .map_err(|e| anyhow::anyhow!("terminal init failed: {e}"))?;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+            .map_err(|e| anyhow::anyhow!("terminal init failed: {e}"))?;
 
     loop {
         terminal
@@ -3095,7 +3837,8 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         let mut line = String::new();
         for word in para.split_whitespace() {
             let mut word = word.to_string();
-            if UnicodeWidthStr::width(line.as_str()) + UnicodeWidthStr::width(word.as_str()) + 1 > w {
+            if UnicodeWidthStr::width(line.as_str()) + UnicodeWidthStr::width(word.as_str()) + 1 > w
+            {
                 if !line.is_empty() {
                     out.push(std::mem::take(&mut line));
                 }
@@ -3112,7 +3855,9 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 }
                 line.push_str(&word);
             } else {
-                if !line.is_empty() { line.push(' '); }
+                if !line.is_empty() {
+                    line.push(' ');
+                }
                 line.push_str(&word);
             }
         }
@@ -3130,7 +3875,12 @@ mod tests {
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     #[test]
@@ -3164,7 +3914,9 @@ mod tests {
         let rows = wrap_composer(&"x".repeat(25), 10);
         let joined: String = rows.concat();
         assert_eq!(joined, "x".repeat(25));
-        assert!(rows.iter().all(|r| UnicodeWidthStr::width(r.as_str()) <= 10));
+        assert!(rows
+            .iter()
+            .all(|r| UnicodeWidthStr::width(r.as_str()) <= 10));
     }
 
     #[test]
@@ -3189,7 +3941,11 @@ mod tests {
         // Explicit lines expand the box line-by-line; the trailing newline
         // adds a final empty row for the cursor.
         t.input = "l1\nl2\nl3\nl4\n".into();
-        assert_eq!(t.composer_height(80, 30), 7, "4 lines + trailing blank + borders");
+        assert_eq!(
+            t.composer_height(80, 30),
+            7,
+            "4 lines + trailing blank + borders"
+        );
         // Long single token wraps and counts as multiple rows.
         t.input = "x".repeat(200);
         let h = t.composer_height(40, 30);
@@ -3222,16 +3978,28 @@ mod tests {
         assert_eq!(Tui::dash_width(88, 50), Some(40));
         assert_eq!(Tui::dash_width(147, 39), Some(40), "Termux landscape");
         assert_eq!(Tui::dash_width(88, 38), None, "too short — no dashboard");
-        assert_eq!(Tui::dash_width(100, 30), None, "short terminal keeps old layout");
+        assert_eq!(
+            Tui::dash_width(100, 30),
+            None,
+            "short terminal keeps old layout"
+        );
         assert_eq!(Tui::dash_width(220, 60), Some(40));
     }
 
     #[test]
     fn header_height_scales_down_on_small_screens() {
-        // Full 13-row banner only when wide AND tall.
+        // Full 11-row banner only when wide AND tall.
         assert_eq!(Tui::header_height(120, 30, true), HEADER_HEIGHT);
-        assert_eq!(Tui::header_height(120, 22, true), HEADER_COMPACT, "too short for art");
-        assert_eq!(Tui::header_height(59, 50, true), HEADER_COMPACT, "too narrow for art");
+        assert_eq!(
+            Tui::header_height(120, 22, true),
+            HEADER_COMPACT,
+            "too short for art"
+        );
+        assert_eq!(
+            Tui::header_height(59, 50, true),
+            HEADER_COMPACT,
+            "too narrow for art"
+        );
         assert_eq!(Tui::header_height(120, 9, true), 0, "way too short");
         assert_eq!(Tui::header_height(39, 20, true), 0, "too narrow");
         // Toggling the banner off always yields no header.
@@ -3253,7 +4021,10 @@ mod tests {
     fn hint_line_never_exceeds_width() {
         for w in [6u16, 12, 20, 40, 80] {
             let h = Tui::hint_line(w);
-            assert!(h.chars().count() <= w as usize, "hint too wide at {w}: {h:?}");
+            assert!(
+                h.chars().count() <= w as usize,
+                "hint too wide at {w}: {h:?}"
+            );
         }
         // Narrow width yields a tiny fallback, not an empty line.
         assert!(!Tui::hint_line(10).is_empty());
@@ -3283,13 +4054,20 @@ mod tests {
     #[test]
     fn picker_tap_confirms_tapped_row_and_closes() {
         let mut t = Tui::new();
-        t.open_picker("theme", vec!["lauda".into(), "dracula".into(), "nord".into()]);
+        t.open_picker(
+            "theme",
+            vec!["lauda".into(), "dracula".into(), "nord".into()],
+        );
         // Imitate a drawn picker filling a 50x10 screen; item rows begin at
         // area.y + 2 (top border + filter row).
         let area = Rect::new(0, 0, 50, 10);
         t.last_picker = Some(area);
         // Tap the third row (index 2 → "nord").
-        let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, area.y + 2 + 2));
+        let action = t.on_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            4,
+            area.y + 2 + 2,
+        ));
         match action {
             Some(Action::OpenSlash(cmd)) => assert_eq!(cmd, "theme:nord"),
             other => panic!("expected OpenSlash, got {other:?}"),
@@ -3317,7 +4095,11 @@ mod tests {
         t.last_composer = Some(Rect::new(0, 20, 40, 3));
         // Tap the first character cell (x=1, inner row 0 → y=21).
         t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 21));
-        assert!(t.cursor == 0, "caret should jump to start, got {}", t.cursor);
+        assert!(
+            t.cursor == 0,
+            "caret should jump to start, got {}",
+            t.cursor
+        );
         // Tapping an empty composer changes nothing.
         t.input.clear();
         t.cursor = 0;
@@ -3412,13 +4194,17 @@ mod tests {
         t.cursor = 1;
         let rect = Rect::new(0, 10, 40, 8);
         // The underlying chip is registered first (drawn earlier).
-        t.tap_targets.push((Rect::new(0, 10, 40, 1), Tap::ScrollHint));
+        t.tap_targets
+            .push((Rect::new(0, 10, 40, 1), Tap::ScrollHint));
         t.last_at_popup = Some(rect);
         t.tap_targets.push((rect, Tap::AtPopup));
         // Tap the first visible row, which overlaps the scroll hint.
         let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, rect.y + 1));
         assert!(matches!(action, Some(Action::None)));
-        assert_eq!(t.input, "@README.md ", "popup completion wins over the chip");
+        assert_eq!(
+            t.input, "@README.md ",
+            "popup completion wins over the chip"
+        );
         assert!(!t.at_popup_active());
     }
 
@@ -3427,9 +4213,10 @@ mod tests {
         let mut t = Tui::new();
         // Mode chip — same as Tab.
         t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::ModeChip));
-        assert!(
-            matches!(t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0)), Some(Action::CycleMode))
-        );
+        assert!(matches!(
+            t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0)),
+            Some(Action::CycleMode)
+        ));
         // Banner tap toggles it (same as Ctrl+B).
         t.tap_targets.clear();
         let before = t.show_banner;
@@ -3439,13 +4226,15 @@ mod tests {
         // Scroll hint jumps back to the live tail.
         t.tap_targets.clear();
         t.scroll = 7;
-        t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::ScrollHint));
+        t.tap_targets
+            .push((Rect::new(0, 0, 10, 1), Tap::ScrollHint));
         let _ = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
         assert_eq!(t.scroll, 0);
         // Overlay tap dismisses the overlay.
         t.tap_targets.clear();
         t.overlay = true;
-        t.tap_targets.push((Rect::new(0, 0, 10, 1), Tap::OverlayClose));
+        t.tap_targets
+            .push((Rect::new(0, 0, 10, 1), Tap::OverlayClose));
         let _ = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
         assert!(!t.overlay);
     }
@@ -3465,26 +4254,50 @@ mod tests {
         let mut t = Tui::new();
         t.set_busy(true, "working");
         // First Esc arms the interrupt instead of firing it.
-        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        ));
         assert!(t.is_busy(), "arming must not stop the agent");
         // A second Esc within the window confirms: interrupt fires.
-        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::Interrupt));
-        assert!(t.esc_armed_at.is_none(), "armed flag must clear after the interrupt");
+        assert!(matches!(
+            t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Interrupt
+        ));
+        assert!(
+            t.esc_armed_at.is_none(),
+            "armed flag must clear after the interrupt"
+        );
         // Idle Esc keeps its old single-press semantics (clears the composer).
         t.set_busy(false, "");
         t.input = "draft".into();
-        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::Interrupt));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Interrupt
+        ));
         assert!(t.input.is_empty());
         // Arming expires: a late second Esc must NOT interrupt — and the
         // next press re-arms fresh instead of firing immediately.
         t.set_busy(true, "working");
-        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        ));
         t.esc_armed_at = Some(Instant::now() - ESC_ARM_WINDOW - Duration::from_millis(1));
-        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
-        assert!(t.esc_armed_at.is_some(), "re-armed for the next confirming press");
+        assert!(matches!(
+            t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(
+            t.esc_armed_at.is_some(),
+            "re-armed for the next confirming press"
+        );
         t.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(t.esc_armed_at.is_none(), "other keys disarm");
-        assert!(matches!(t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)), Action::None));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        ));
         t.set_busy(false, "");
         assert!(t.esc_armed_at.is_none(), "finishing a turn disarms");
     }
@@ -3495,7 +4308,8 @@ mod tests {
         t.input = "hello".into();
         t.cursor = 5;
         // "enter" is chip 0 in the full chip list.
-        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::HintChip(0)));
+        t.tap_targets
+            .push((Rect::new(0, 0, 6, 1), Tap::HintChip(0)));
         match t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)) {
             Some(Action::Submit(s)) => assert_eq!(s, "hello"),
             other => panic!("expected Submit, got {other:?}"),
@@ -3504,17 +4318,26 @@ mod tests {
         // "esc" chip mirrors the real Esc: clears input + signals interrupt.
         t.tap_targets.clear();
         t.input = "draft".into();
-        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::HintChip(1)));
+        t.tap_targets
+            .push((Rect::new(0, 0, 6, 1), Tap::HintChip(1)));
+        assert!(matches!(
+            t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)),
+            Some(Action::Interrupt)
+        ));
         assert!(
-            matches!(t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)), Some(Action::Interrupt))
+            t.input.is_empty(),
+            "esc chip clears the composer like the key"
         );
-        assert!(t.input.is_empty(), "esc chip clears the composer like the key");
     }
 
     #[test]
     fn approval_buttons_are_tappable() {
         let mut t = Tui::new();
-        for (x, expect) in [(0, Tap::Approval('y')), (6, Tap::Approval('a')), (13, Tap::Approval('n'))] {
+        for (x, expect) in [
+            (0, Tap::Approval('y')),
+            (6, Tap::Approval('a')),
+            (13, Tap::Approval('n')),
+        ] {
             t.tap_targets.clear();
             t.tap_targets.push((Rect::new(x, 0, 5, 1), expect));
             let action = t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, 0));
@@ -3527,7 +4350,8 @@ mod tests {
         let mut t = Tui::new();
         t.open_input_modal(InputModal::new("api key", "paste key", true));
         t.input_modal.as_mut().unwrap().value = "sk-test".into();
-        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::InputConfirm));
+        t.tap_targets
+            .push((Rect::new(0, 0, 6, 1), Tap::InputConfirm));
         match t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)) {
             Some(Action::InputSubmit(v)) => assert_eq!(v, "sk-test"),
             other => panic!("expected InputSubmit, got {other:?}"),
@@ -3536,8 +4360,12 @@ mod tests {
         // Cancel discards the value and just closes.
         t.open_input_modal(InputModal::new("api key", "paste key", true));
         t.input_modal.as_mut().unwrap().value = "sk-nope".into();
-        t.tap_targets.push((Rect::new(0, 0, 6, 1), Tap::InputCancel));
-        assert!(matches!(t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)), Some(Action::None)));
+        t.tap_targets
+            .push((Rect::new(0, 0, 6, 1), Tap::InputCancel));
+        assert!(matches!(
+            t.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0)),
+            Some(Action::None)
+        ));
         assert!(t.input_modal.is_none(), "cancel closes the modal");
     }
 
@@ -3582,8 +4410,14 @@ mod tests {
         // Context meter is fed separately by the usage event path.
         t.set_usage(46_000, 128_000);
         t.dash.set_plan(&[
-            TodoItem { content: "a".into(), status: "completed".into() },
-            TodoItem { content: "b".into(), status: "pending".into() },
+            TodoItem {
+                content: "a".into(),
+                status: "completed".into(),
+            },
+            TodoItem {
+                content: "b".into(),
+                status: "pending".into(),
+            },
         ]);
         let lines = t.dashboard_lines(28);
         let text: Vec<String> = lines
@@ -3595,33 +4429,50 @@ mod tests {
         assert!(joined.contains("ox-alpha"));
         assert!(joined.contains("BUILD"), "mode row present");
         // Latest request wins.
-        assert!(joined.contains("46.0k"), "prompt tokens humanized: {joined}");
-        assert!(joined.contains("2.0k"), "completion tokens humanized: {joined}");
+        assert!(
+            joined.contains("46.0k"),
+            "prompt tokens humanized: {joined}"
+        );
+        assert!(
+            joined.contains("2.0k"),
+            "completion tokens humanized: {joined}"
+        );
         assert!(joined.contains("1/2 done"), "plan progress: {joined}");
         assert!(joined.contains("requests"), "counter rows exist");
         assert!(joined.contains("█"), "context bar drawn");
+    }
+
+    /// Names matched by a slash-command query — index-independent so adding
+    /// or reordering commands can't silently break the assertions below.
+    fn matched_names(query: &str) -> Vec<&'static str> {
+        filter_slash_commands(query)
+            .into_iter()
+            .map(|i| SLASH_COMMANDS[i].0)
+            .collect()
     }
 
     #[test]
     fn slash_filter_matches_prefixes_case_insensitively() {
         assert_eq!(filter_slash_commands("/").len(), SLASH_COMMANDS.len());
         assert_eq!(filter_slash_commands("").len(), SLASH_COMMANDS.len());
-        assert_eq!(filter_slash_commands("/pro"), vec![4]); // /provider
-        assert_eq!(filter_slash_commands("/appro"), vec![3]); // /approvals
-        assert_eq!(filter_slash_commands("/resum"), vec![9]); // /resume
-        assert_eq!(filter_slash_commands("/imag"), vec![11]); // /image
-        assert_eq!(filter_slash_commands("/RETRY"), vec![7]);
-        assert_eq!(filter_slash_commands("/reason"), vec![2]); // /reasoning
-        assert_eq!(filter_slash_commands("/quit"), vec![17]);
-        // Newer commands are discoverable too.
-        assert_eq!(filter_slash_commands("/status"), vec![12]);
-        assert_eq!(filter_slash_commands("/diff"), vec![13]);
-        assert_eq!(filter_slash_commands("/review"), vec![14]);
-        assert_eq!(filter_slash_commands("/undo"), vec![15]);
-        assert_eq!(filter_slash_commands("/session"), vec![10]);
-        let skills = filter_slash_commands("/ski");
-        assert_eq!(skills.len(), 1);
-        assert_eq!(SLASH_COMMANDS[skills[0]].0, "/skills");
+        assert_eq!(matched_names("/pro"), vec!["/provider"]);
+        assert_eq!(matched_names("/appro"), vec!["/approvals"]);
+        assert_eq!(matched_names("/resum"), vec!["/resume"]);
+        assert_eq!(matched_names("/imag"), vec!["/image"]);
+        assert_eq!(matched_names("/RETRY"), vec!["/retry"]);
+        assert_eq!(matched_names("/reason"), vec!["/reasoning"]);
+        assert_eq!(matched_names("/quit"), vec!["/quit"]);
+        assert_eq!(matched_names("/status"), vec!["/status"]);
+        assert_eq!(matched_names("/diff"), vec!["/diff"]);
+        assert_eq!(matched_names("/review"), vec!["/review"]);
+        assert_eq!(matched_names("/undo"), vec!["/undo"]);
+        assert_eq!(matched_names("/session"), vec!["/session"]);
+        // Checkpointing trio.
+        assert_eq!(
+            matched_names("/checkpoint"),
+            vec!["/checkpoint", "/checkpoints"]
+        );
+        assert_eq!(matched_names("/branch"), vec!["/branch"]);
         assert!(filter_slash_commands("/zzz").is_empty());
     }
 
@@ -3702,7 +4553,10 @@ mod tests {
         t.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         // Wrapped backwards from 0 to last.
         assert_eq!(t.slash_sel, SLASH_COMMANDS.len() - 1);
-        assert_eq!(t.scroll, 0, "transcript must not scroll while popup is open");
+        assert_eq!(
+            t.scroll, 0,
+            "transcript must not scroll while popup is open"
+        );
     }
 
     #[test]
@@ -3772,7 +4626,10 @@ mod tests {
         }
         assert!(t.pending_approval.is_none());
         t.open_approval("x".into());
-        assert!(matches!(t.on_key(key(KeyCode::Char('y'), KeyModifiers::NONE)), Action::Approve(true)));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::Approve(true)
+        ));
     }
 
     #[test]
@@ -3790,12 +4647,18 @@ mod tests {
     fn plain_typing_still_works_with_popup_logic() {
         let mut t = Tui::new();
         t.input = "fix the bug".into();
-        assert!(matches!(t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit(_)));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Submit(_)
+        ));
     }
 
     fn submit(t: &mut Tui, text: &str) {
         t.input = text.into();
-        assert!(matches!(t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)), Action::Submit(_)));
+        assert!(matches!(
+            t.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Submit(_)
+        ));
     }
 
     #[test]
@@ -3921,7 +4784,10 @@ mod tests {
         use crate::diff::unified_diff;
         let d = unified_diff("src/lib.rs", "a\nb\n", "a\nc\n", 1);
         let mut t = Tui::new();
-        t.push(Entry::ToolDiff { name: "edit_file".into(), files: vec![d] });
+        t.push(Entry::ToolDiff {
+            name: "edit_file".into(),
+            files: vec![d],
+        });
         let lines = line_texts(&t, 60);
         let joined = lines.join("\n");
         assert!(joined.contains("✎ edit_file"), "{joined}");
@@ -3935,39 +4801,226 @@ mod tests {
         let add_line = probe
             .cached_lines
             .iter()
-            .find(|l| l.spans.len() >= 3 && l.spans[0].content == "│" && l.spans[1].content == "+" && l.spans[2].content == "c")
+            .find(|l| {
+                l.spans.len() >= 3
+                    && l.spans[0].content == "│"
+                    && l.spans[1].content == "+"
+                    && l.spans[2].content == "c"
+            })
             .unwrap_or_else(|| panic!("no +c diff line"));
-        assert_eq!(add_line.spans[0].style.fg, Some(crate::theme::get().success), "add bar green");
-        assert_eq!(add_line.spans[1].style.fg, Some(crate::theme::get().success), "+ sign stays green");
-        assert_eq!(add_line.spans[2].style.bg, Some(crate::theme::get().add_bg), "add tint behind content");
+        assert_eq!(
+            add_line.spans[0].style.fg,
+            Some(crate::theme::get().success),
+            "add bar green"
+        );
+        assert_eq!(
+            add_line.spans[1].style.fg,
+            Some(crate::theme::get().success),
+            "+ sign stays green"
+        );
+        assert_eq!(
+            add_line.spans[2].style.bg,
+            Some(crate::theme::get().add_bg),
+            "add tint behind content"
+        );
         let del_line = probe
             .cached_lines
             .iter()
-            .find(|l| l.spans.len() >= 3 && l.spans[0].content == "│" && l.spans[1].content == "-" && l.spans[2].content == "b")
+            .find(|l| {
+                l.spans.len() >= 3
+                    && l.spans[0].content == "│"
+                    && l.spans[1].content == "-"
+                    && l.spans[2].content == "b"
+            })
             .unwrap();
-        assert_eq!(del_line.spans[0].style.fg, Some(crate::theme::get().error), "del bar red");
-        assert_eq!(del_line.spans[2].style.bg, Some(crate::theme::get().del_bg), "del tint behind content");
+        assert_eq!(
+            del_line.spans[0].style.fg,
+            Some(crate::theme::get().error),
+            "del bar red"
+        );
+        assert_eq!(
+            del_line.spans[2].style.bg,
+            Some(crate::theme::get().del_bg),
+            "del tint behind content"
+        );
     }
 
     #[test]
-    fn banner_spells_laudacode_shape() {
-        let lines: Vec<&str> = BANNER.lines().collect();
-        assert_eq!(lines.len(), HEADER_HEIGHT as usize);
-        // Branding is embedded in the art's right-hand columns.
-        assert!(BANNER.contains("LaudaCode"));
-        assert!(BANNER.contains("pure Rust"));
-        assert!(BANNER.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
-        for line in &lines {
-            assert!(!line.trim().is_empty());
-            assert!(!line.contains('\t'), "tabs would break column alignment");
-            // Rows are left-anchored braille art — no trailing dead space.
-            let trimmed = line.trim_end_matches(' ');
-            assert!(!trimmed.is_empty());
+    fn every_logo_fits_the_banner_band() {
+        assert!(
+            LOGOS.len() >= 7,
+            "expected a varied banner set, got {}",
+            LOGOS.len()
+        );
+        let mut names: Vec<&str> = LOGOS.iter().map(|a| a.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate logo name in {names:?}");
+        for art in LOGOS {
             assert!(
-                trimmed.starts_with(' ')
-                    || ('\u{2800}'..='\u{28FF}').contains(&trimmed.chars().next().unwrap()),
-                "every row must start with a braille glyph or space"
+                art.rows.len() as u16 <= HEADER_HEIGHT,
+                "{} is {} rows, band is {HEADER_HEIGHT}",
+                art.name,
+                art.rows.len()
             );
+            for row in art.rows {
+                for Seg(text, _) in *row {
+                    assert!(!text.contains('\t'), "{}: tabs break alignment", art.name);
+                }
+            }
+            // Boxed logos must have every row the same width or the right-hand
+            // border stair-steps. Left-aligned logos (no border glyph) are
+            // exempt. The art's width only tracks its widest row, so check this here.
+            // A real box opens with ╭ and closes with ╯ — free-form art can
+            // contain │ (a rocket fuselage, a circuit trace) without being one.
+            let boxed = art
+                .rows
+                .first()
+                .is_some_and(|r| r.iter().any(|s| s.0.contains('╭')))
+                && art
+                    .rows
+                    .last()
+                    .is_some_and(|r| r.iter().any(|s| s.0.contains('╯')));
+            if boxed {
+                let widths: Vec<usize> = art
+                    .rows
+                    .iter()
+                    .map(|r| r.iter().map(|s| s.0.chars().count()).sum())
+                    .collect();
+                let w = widths[0];
+                for (i, got) in widths.iter().enumerate() {
+                    assert_eq!(
+                        *got, w,
+                        "{}: row {i} is {got} wide, row 0 is {w} — border won't line up",
+                        art.name
+                    );
+                }
+            }
+            // Rendering must always fill the band, whatever the logo's height.
+            assert_eq!(
+                banner_lines(art).len(),
+                HEADER_HEIGHT as usize,
+                "{}",
+                art.name
+            );
+            // Every logo must carry the name/version/tagline. Alignment and
+            // column placement are asserted by
+            // `identity_block_sits_right_of_every_logo`.
+            let text: String = banner_lines(art)
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert!(text.contains("LaudaCode"), "{} lost the name", art.name);
+            assert!(
+                text.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+                "{} lost the version",
+                art.name
+            );
+            assert!(
+                text.contains("AI coding agent"),
+                "{} lost the tagline",
+                art.name
+            );
+        }
+    }
+
+    #[test]
+    fn identity_block_sits_in_one_column_right_of_every_logo() {
+        // All three identity lines — not just the name — must start in the same
+        // column, on adjacent rows, and nothing may spill past that column.
+        let tags = [
+            "LaudaCode",
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            "AI coding agent",
+        ];
+        for art in LOGOS {
+            let lines = banner_lines(art);
+            let want = art_width(art) as usize + INFO_GUTTER as usize;
+            let mut rows = Vec::new();
+            for (y, line) in lines.iter().enumerate() {
+                let mut col = 0usize;
+                for span in &line.spans {
+                    let text: &str = span.content.as_ref();
+                    // Only the block counts: the terminal logo repeats the
+                    // version inside its own title bar, left of the block.
+                    if col >= want && tags.contains(&text) {
+                        assert_eq!(
+                            col, want,
+                            "{}: {text:?} at col {col}, want {want}",
+                            art.name
+                        );
+                        rows.push(y);
+                    }
+                    col += text.chars().count();
+                }
+            }
+            assert_eq!(rows.len(), tags.len(), "{}: block incomplete", art.name);
+            let (lo, hi) = (
+                rows.iter().min().copied().unwrap(),
+                rows.iter().max().copied().unwrap(),
+            );
+            assert_eq!(hi - lo, 2, "{}: block rows not adjacent", art.name);
+            let widest = lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap();
+            assert!(
+                widest <= composed_width(art) as usize,
+                "{}: row is {widest} wide, budget {}",
+                art.name,
+                composed_width(art)
+            );
+        }
+    }
+
+    #[test]
+    fn a_logo_fits_from_its_narrowest_width_upward() {
+        // The one-line identity header is only for widths where nothing fits,
+        // so the threshold must be exactly the narrowest composed logo.
+        let narrowest = LOGOS
+            .iter()
+            .map(composed_width)
+            .min()
+            .expect("logo table is not empty");
+        assert!(
+            !any_logo_fits(narrowest - 1),
+            "claimed a fit one col too narrow"
+        );
+        assert!(
+            any_logo_fits(narrowest),
+            "narrowest logo does not fit itself"
+        );
+        for w in [narrowest, narrowest + 1, 80, 200, u16::MAX] {
+            assert!(any_logo_fits(w), "nothing fits at {w}");
+        }
+    }
+
+    #[test]
+    fn narrow_terminals_never_pick_a_logo_that_clips() {
+        // Everything must be a legal pick at any width, and wide-enough
+        // widths may only return logos whose composed width (art + identity
+        // block) actually fits.
+        for w in [20u16, 40, 54, 60, 80, 200] {
+            for _ in 0..200 {
+                let art = pick_logo(w);
+                if composed_width(art) <= w {
+                    continue;
+                }
+                assert!(
+                    LOGOS.iter().all(|a| composed_width(a) > w),
+                    "at w={w} picked {} (needs {}) but others fit",
+                    art.name,
+                    composed_width(art)
+                );
+            }
         }
     }
 
@@ -3979,6 +5032,21 @@ mod tests {
         assert!(!t.banner_visible());
         t.toggle_banner();
         assert!(t.banner_visible());
+    }
+
+    #[test]
+    fn banner_toggle_rerolls_the_logo() {
+        // Ctrl+B doubles as "show me another logo". With enough draws across
+        // restarts both variants should show up.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..400 {
+            let mut t = Tui::new();
+            seen.insert(t.banner_logo().name);
+            t.toggle_banner();
+            t.toggle_banner();
+            seen.insert(t.banner_logo().name);
+        }
+        assert!(seen.len() > 1, "logo never changed: {seen:?}");
     }
 
     #[test]
@@ -4003,7 +5071,7 @@ mod tests {
     #[test]
     fn banner_gradient_matches_rows() {
         let grad = banner_colors();
-        assert_eq!(grad.len(), BANNER.lines().count());
+        assert_eq!(grad.len(), HEADER_HEIGHT as usize);
         // Gradient endpoints come from the theme's stops.
         let t = crate::theme::get();
         assert_eq!(grad[0], t.banner[0]);
@@ -4029,7 +5097,11 @@ mod tests {
             .iter()
             .map(|l| {
                 (
-                    l.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(""),
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.clone())
+                        .collect::<Vec<_>>()
+                        .join(""),
                     l.spans.first().and_then(|s| s.style.fg),
                 )
             })
@@ -4041,7 +5113,10 @@ mod tests {
         let mut t = Tui::new();
         t.set_busy(true, "working");
         assert!(t.is_busy());
-        assert!(t.entries.is_empty(), "activity must not create transcript entries");
+        assert!(
+            t.entries.is_empty(),
+            "activity must not create transcript entries"
+        );
         t.set_busy(false, "working");
         assert!(!t.is_busy());
     }
@@ -4081,7 +5156,10 @@ mod tests {
             let spans = meter(pct, slots);
             let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
             let bars = text.chars().filter(|c| *c == '█' || *c == '░').count();
-            assert_eq!(bars, slots, "meter at {pct}% must fill exactly {slots} slots");
+            assert_eq!(
+                bars, slots,
+                "meter at {pct}% must fill exactly {slots} slots"
+            );
         }
         // Escalates to the warning color between 60-84% and error above.
         let warn = meter(70, 4);
@@ -4105,7 +5183,8 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut t = Tui::new();
-        t.dash.set_session("abcdef0123456", "model-x", "openrouter", "/tmp/proj", 3);
+        t.dash
+            .set_session("abcdef0123456", "model-x", "openrouter", "/tmp/proj", 3);
         t.entries.push(Entry::ToolResult {
             name: "read_file".into(),
             ok: true,
@@ -4119,9 +5198,8 @@ mod tests {
         // The composer border must carry the active mode color, proving the
         // chrome is themed rather than hardcoded.
         let mode_color = Some(t.mode.color());
-        let has_mode_border = (0..buf.area.height).any(|y| {
-            (0..buf.area.width).any(|x| buf.cell((x, y)).map(|c| c.fg) == mode_color)
-        });
+        let has_mode_border = (0..buf.area.height)
+            .any(|y| (0..buf.area.width).any(|x| buf.cell((x, y)).map(|c| c.fg) == mode_color));
         assert!(has_mode_border, "composer border should use the mode color");
     }
 
@@ -4132,12 +5210,29 @@ mod tests {
         use ratatui::Terminal;
         type Setup = Box<dyn Fn(&mut Tui)>;
         let scenarios: Vec<(&str, Setup)> = vec![
-            ("slash popup", Box::new(|t: &mut Tui| { t.input = "/th".into(); t.cursor = 3; })),
-            ("approval modal", Box::new(|t: &mut Tui| { t.pending_approval = Some("run_command: rm -rf target/".into()); })),
+            (
+                "slash popup",
+                Box::new(|t: &mut Tui| {
+                    t.input = "/th".into();
+                    t.cursor = 3;
+                }),
+            ),
+            (
+                "approval modal",
+                Box::new(|t: &mut Tui| {
+                    t.pending_approval = Some("run_command: rm -rf target/".into());
+                }),
+            ),
         ];
         for (name, setup) in scenarios {
             let mut t = Tui::new();
-            t.dash.set_session("a1b2c3d4e5f6g", "stealth/ox-alpha", "openrouter", "/home/u/Laudacode", 4);
+            t.dash.set_session(
+                "a1b2c3d4e5f6g",
+                "stealth/ox-alpha",
+                "openrouter",
+                "/home/u/Laudacode",
+                4,
+            );
             t.dash.record_usage(12_400, 3_100);
             t.ctx_used = 42_000;
             t.entries.push(Entry::User("tidy up the composer".into()));

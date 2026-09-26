@@ -13,6 +13,48 @@ approval_mode = "auto-edit"
 # /reasoning — normal · low · medium · high · max). None = model default.
 # model_reasoning_effort = "high"
 
+# Assumed context window in tokens. Drives the "ctx left" meter and the
+# auto-compact threshold (80% of this). Omit to use a per-model default.
+# context_window = 128000
+
+# Structured JSONL log of tool calls, token usage, hook results and budget
+# blocks. Off unless `enabled = true`; prompts and file contents are never
+# written, so the log stays safe to share. With no `file` the events go to
+# stderr; set one to write them to disk instead.
+# [logging]
+# enabled = true
+# file    = "~/.local/share/laudacode/session.jsonl"   # `~` is expanded
+
+# Session guardrails. Both are cumulative for the whole conversation; hitting
+# either stops the turn with an error instead of silently burning tokens.
+# [limits]
+# max_tokens  = 500000
+# max_cost_usd = 5.0
+
+# How many times a failed provider request is retried before the turn gives
+# up. Retries cover dropped connections and 408/409/429/5xx responses, and
+# honor the server's `Retry-After` header when it sends one. A bad key or a
+# malformed request still fails immediately — retrying those is pointless.
+# Omit this to get the default of 5 retries (6 attempts per request); set 0 to
+# disable retries entirely. Clamped to 20.
+# max_retries = 5
+
+# Commands run after every file-mutating tool call (edit_file, write_file,
+# apply_patch). They receive the touched paths in $LAUDACODE_CHANGED_FILES
+# (space-separated) and their exit status plus first output line is reported
+# back to the model, so a failing formatter or test run gets fixed instead of
+# ignored. Keep them fast — a 30s timeout applies to each.
+# [hooks]
+# post_edit = ["cargo fmt", "cargo clippy --quiet -- -D warnings"]
+# post_edit_timeout_secs = 30
+
+# Transport tuning for every outgoing request (model calls, fetch_url, web
+# search). Applied once at startup, so all clients share it.
+# [network]
+# proxy     = "http://127.0.0.1:8080"        # http/https/socks5
+# ca_bundle = "~/.config/laudacode/corp.pem" # extra trusted roots (PEM)
+# insecure  = false                           # skip TLS verification (risky)
+
 [providers.tokenrouter]
 base_url = "https://api.tokenrouter.com/v1"
 api_key  = "tr-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -112,3 +154,8 @@ model      = "gpt-5"
 # [providers.openrouter.headers]
 # "HTTP-Referer" = "https://github.com/Anon4You/Laudacode"
 # "X-Title"      = "Laudacode"
+
+# Named bundles of provider overrides, selected with --profile:
+# [profiles.fast]
+# model = "stealth/ox-alpha"
+# reasoning_effort = "low"

@@ -169,7 +169,10 @@ mod tests {
             p.resolve("webfetch", "https://docs.example.com/api"),
             Some(Rule::Allow)
         );
-        assert_eq!(p.resolve("webfetch", "https://evil.example.net"), Some(Rule::Ask));
+        assert_eq!(
+            p.resolve("webfetch", "https://evil.example.net"),
+            Some(Rule::Ask)
+        );
     }
 
     #[test]
@@ -180,7 +183,11 @@ mod tests {
 "sh?-c" = "deny"
 "#,
         );
-        assert_eq!(p.resolve("bash", "shx-c"), Some(Rule::Deny), "? matches one char");
+        assert_eq!(
+            p.resolve("bash", "shx-c"),
+            Some(Rule::Deny),
+            "? matches one char"
+        );
         assert_eq!(p.resolve("bash", "shxy-c"), None, "? is exactly one char");
     }
 
@@ -188,7 +195,10 @@ mod tests {
     fn env_files_denied_by_default_except_example() {
         assert_eq!(Permissions::secret_guard(".env"), Some(Rule::Deny));
         assert_eq!(Permissions::secret_guard(".env.local"), Some(Rule::Deny));
-        assert_eq!(Permissions::secret_guard("src/.env.production"), Some(Rule::Deny));
+        assert_eq!(
+            Permissions::secret_guard("src/.env.production"),
+            Some(Rule::Deny)
+        );
         assert_eq!(Permissions::secret_guard(".env.example"), None);
         assert_eq!(Permissions::secret_guard("main.rs"), None);
     }
@@ -206,10 +216,8 @@ mod tests {
             toml::from_str("[permission.bash]\n\"git *\" = \"allow\"").unwrap();
         assert_eq!(cfg.permission.resolve("bash", "git log"), Some(Rule::Allow));
         // Custom agents round-trip too.
-        let cfg: crate::config::Config = toml::from_str(
-            "[agents.security]\nprompt = \"audit deps\"\nread_only = true",
-        )
-        .unwrap();
+        let cfg: crate::config::Config =
+            toml::from_str("[agents.security]\nprompt = \"audit deps\"\nread_only = true").unwrap();
         assert_eq!(cfg.agents["security"].prompt, "audit deps");
         assert!(cfg.agents["security"].read_only);
     }

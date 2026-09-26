@@ -66,6 +66,84 @@ pub struct CustomAgent {
     pub read_only: bool,
 }
 
+/// Shell commands run automatically after a file-mutating tool succeeds
+/// (`[hooks]`). A non-zero exit does not undo the edit; it is reported back to
+/// the model as a warning so it can react (e.g. reformat then re-test).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Hooks {
+    /// Each entry is a shell command run via `sh -c` in the workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_edit: Vec<String>,
+    /// Per-hook wall-clock limit in seconds (default 60).
+    #[serde(default = "default_hook_timeout")]
+    pub post_edit_timeout_secs: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    60
+}
+
+/// Session guardrails (`[limits]`). Unset fields mean "no limit".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Limits {
+    /// Stop making requests once the estimated session cost exceeds this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    /// Stop once cumulative prompt+completion tokens exceed this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// How many times to retry a failed request before giving up, on top of
+    /// the first attempt. Only transient failures are retried (connection
+    /// errors, 408/409/429/5xx); a 401 or a malformed request fails fast.
+    /// Defaults to 5 retries, i.e. up to 6 attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+}
+
+/// Structured (JSONL) run log (`[logging]`). Off unless a file is configured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Logging {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Log file path. `~` expands to the home directory. Omit to log to
+    /// stderr only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Also mirror the same events to stderr when a `file` is set.
+    #[serde(default)]
+    pub stderr: bool,
+}
+
+impl Logging {
+    /// Logging is on whenever it is enabled: an explicit `file` if given,
+    /// otherwise stderr. Both sinks can be used at once.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether a file sink is configured (as opposed to stderr-only).
+    pub fn has_file(&self) -> bool {
+        self.file
+            .as_deref()
+            .map(|f| !f.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// HTTP transport tuning (`[network]`), applied to the provider client.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Network {
+    /// Proxy URL, e.g. "http://127.0.0.1:8080" or "socks5://127.0.0.1:1080".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Path to a PEM bundle of extra trusted roots (corporate MITM, self-signed
+    /// gateway). Requires the `rustls-tls` feature; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +171,31 @@ pub struct Config {
     /// Custom specialists for the delegate tool (`[agents.<name>]`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, CustomAgent>,
+    /// Post-edit automation (`[hooks]`).
+    #[serde(default, skip_serializing_if = "is_default_hooks")]
+    pub hooks: Hooks,
+    /// Session guardrails (`[limits]`).
+    #[serde(default, skip_serializing_if = "is_default_limits")]
+    pub limits: Limits,
+    /// Structured run log (`[logging]`).
+    #[serde(default, skip_serializing_if = "is_default_logging")]
+    pub logging: Logging,
+    /// Provider HTTP transport tuning (`[network]`).
+    #[serde(default, skip_serializing_if = "is_default_network")]
+    pub network: Network,
+}
+
+fn is_default_hooks(h: &Hooks) -> bool {
+    h.post_edit.is_empty() && h.post_edit_timeout_secs == default_hook_timeout()
+}
+fn is_default_limits(l: &Limits) -> bool {
+    l.max_cost_usd.is_none() && l.max_tokens.is_none()
+}
+fn is_default_logging(l: &Logging) -> bool {
+    !l.enabled && l.file.is_none() && !l.stderr
+}
+fn is_default_network(n: &Network) -> bool {
+    n.proxy.is_none() && n.ca_bundle.is_none() && n.insecure.is_none()
 }
 
 /// Fully resolved provider settings ready for an API call.
@@ -111,7 +214,7 @@ pub struct ActiveProvider {
     pub reasoning_effort: Option<String>,
 }
 
-/// Built-in keyless free providers (hardcoded, no API key). Powerbrain is the
+/// Built-in keyless free providers (hardcoded, no API key). AITopia is the
 /// out-of-the-box default chat provider; both names auto-provision when
 /// requested on a blank config, so the app is usable with zero setup.
 pub fn builtin_provider(name: &str) -> Option<Provider> {
@@ -121,7 +224,11 @@ pub fn builtin_provider(name: &str) -> Option<Provider> {
             "powerbrain",
             "gpt-5",
         ),
-        "aitopia" => ("https://extensions.aitopia.ai/ai/send", "aitopia", "AITOPIA"),
+        "aitopia" => (
+            "https://extensions.aitopia.ai/ai/send",
+            "aitopia",
+            "AITOPIA",
+        ),
         _ => return None,
     };
     Some(Provider {
@@ -136,7 +243,7 @@ pub fn builtin_provider(name: &str) -> Option<Provider> {
 
 /// The keyless provider used when nothing at all selects one.
 pub fn builtin_default_provider() -> Provider {
-    builtin_provider("powerbrain").expect("powerbrain builtin exists")
+    builtin_provider("aitopia").expect("aitopia builtin exists")
 }
 
 impl Config {
@@ -182,8 +289,9 @@ impl Config {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", path.display())),
+            Some("json") => {
+                serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+            }
             _ => toml::from_str(&raw).with_context(|| format!("parsing {}", path.display())),
         }
     }
@@ -241,7 +349,7 @@ impl Config {
         };
 
         // If this run has NO provider info anywhere (no config, no env vars, no
-        // CLI flags), fall back to the built-in keyless Powerbrain transport so
+        // CLI flags), fall back to the built-in keyless AITopia transport so
         // the app is usable out of the box without setup or an API key.
         // "default" is the name used when nothing selects a provider; any known
         // built-in free provider name also auto-provisions on a blank config.
@@ -254,8 +362,8 @@ impl Config {
             && std::env::var("OPENAI_BASE_URL").is_err()
             && std::env::var("OPENAI_API_KEY").is_err()
             && std::env::var("OPENAI_MODEL").is_err();
-        let provisioned_builtin = nothing_configured
-            && (name == "default" || builtin_provider(&name).is_some());
+        let provisioned_builtin =
+            nothing_configured && (name == "default" || builtin_provider(&name).is_some());
         if provisioned_builtin {
             p = builtin_default_provider();
             if let Some(builtin) = builtin_provider(&name) {
@@ -263,14 +371,11 @@ impl Config {
             }
         }
 
-        let mut sources: BTreeMap<String, String> = [
-            ("base_url", "none"),
-            ("api_key", "none"),
-            ("model", "none"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let mut sources: BTreeMap<String, String> =
+            [("base_url", "none"), ("api_key", "none"), ("model", "none")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
         if let Some(cfg_p) = self.providers.get(&name) {
             if !cfg_p.base_url.is_empty() {
                 sources.insert("base_url".into(), "config file".into());
@@ -284,7 +389,11 @@ impl Config {
         }
 
         // Environment variables fill in blanks (and override per spec).
-        for (field, var) in [("base_url", "OPENAI_BASE_URL"), ("api_key", "OPENAI_API_KEY"), ("model", "OPENAI_MODEL")] {
+        for (field, var) in [
+            ("base_url", "OPENAI_BASE_URL"),
+            ("api_key", "OPENAI_API_KEY"),
+            ("model", "OPENAI_MODEL"),
+        ] {
             if let Ok(v) = std::env::var(var) {
                 match field {
                     "base_url" => p.base_url = v,
@@ -346,7 +455,10 @@ impl Config {
         }
 
         // Reasoning effort: env beats config-level default beats provider.
-        let mut effort = p.reasoning_effort.clone().or_else(|| self.model_reasoning_effort.clone());
+        let mut effort = p
+            .reasoning_effort
+            .clone()
+            .or_else(|| self.model_reasoning_effort.clone());
         if let Ok(v) = std::env::var("OPENAI_REASONING_EFFORT") {
             if !v.trim().is_empty() {
                 effort = Some(v);
@@ -415,7 +527,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.providers.insert(
             "p".into(),
-            Provider { base_url: "https://config.example/v1".into(), api_key: "cfg".into(), model: "cfg-model".into(), ..Default::default() },
+            Provider {
+                base_url: "https://config.example/v1".into(),
+                api_key: "cfg".into(),
+                model: "cfg-model".into(),
+                ..Default::default()
+            },
         );
         // Config only.
         let a = cfg.resolve_active(Some("p"), None, None, None).unwrap();
@@ -427,17 +544,35 @@ mod tests {
         std::env::remove_var("OPENAI_MODEL");
         // CLI beats env.
         std::env::set_var("OPENAI_MODEL", "env-model");
-        let a = cfg.resolve_active(Some("p"), None, None, Some("cli-model")).unwrap();
+        let a = cfg
+            .resolve_active(Some("p"), None, None, Some("cli-model"))
+            .unwrap();
         assert_eq!(a.model, "cli-model");
         std::env::remove_var("OPENAI_MODEL");
     }
 
     #[test]
     fn resolve_trailing_slash_trimmed_and_missing_provider_detected() {
+        // `resolve_active` falls back to OPENAI_* env vars, and sibling tests
+        // mutate them — serialize so this test sees a clean environment.
+        let _g = env_lock();
+        for var in [
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+            "LAUDACODE_PROVIDER",
+        ] {
+            std::env::remove_var(var);
+        }
         let mut cfg = Config::default();
         cfg.providers.insert(
             "p".into(),
-            Provider { base_url: "https://x.example/v1/".into(), api_key: "k".into(), model: "m".into(), ..Default::default() },
+            Provider {
+                base_url: "https://x.example/v1/".into(),
+                api_key: "k".into(),
+                model: "m".into(),
+                ..Default::default()
+            },
         );
         let a = cfg.resolve_active(Some("p"), None, None, None).unwrap();
         assert_eq!(a.base_url, "https://x.example/v1");
@@ -459,17 +594,24 @@ mod tests {
             std::env::remove_var(var);
         }
         let cfg = Config::default();
-        // Fresh install, nothing configured anywhere → keyless powerbrain.
+        // Fresh install, nothing configured anywhere → keyless aitopia.
         let a = cfg.resolve_active(None, None, None, None).unwrap();
-        assert_eq!(a.kind, "powerbrain");
-        assert_eq!(a.model, "gpt-5");
-        assert_eq!(a.base_url, "https://powerbrainai.com/app/backend/api/api.php");
-        assert_eq!(a.sources.get("base_url").map(String::as_str), Some("built-in default"));
+        assert_eq!(a.kind, "aitopia");
+        assert_eq!(a.model, "AITOPIA");
+        assert_eq!(a.base_url, "https://extensions.aitopia.ai/ai/send");
+        assert_eq!(
+            a.sources.get("base_url").map(String::as_str),
+            Some("built-in default")
+        );
         assert_eq!(a.sources.get("api_key").map(String::as_str), Some("none"));
         // Requesting either built-in by name provisions it too.
-        let a = cfg.resolve_active(Some("powerbrain"), None, None, None).unwrap();
+        let a = cfg
+            .resolve_active(Some("powerbrain"), None, None, None)
+            .unwrap();
         assert_eq!(a.kind, "powerbrain");
-        let a = cfg.resolve_active(Some("aitopia"), None, None, None).unwrap();
+        let a = cfg
+            .resolve_active(Some("aitopia"), None, None, None)
+            .unwrap();
         assert_eq!(a.kind, "aitopia");
         assert_eq!(a.model, "AITOPIA");
         // Unknown unconfigured providers still fail loudly.
@@ -478,11 +620,16 @@ mod tests {
         // env/CLI provider info voids the built-in fallback entirely.
         std::env::set_var("OPENAI_MODEL", "env-model");
         std::env::set_var("OPENAI_API_KEY", "env-key");
-        let a = cfg.resolve_active(Some("aitopia"), None, None, None).unwrap();
+        let a = cfg
+            .resolve_active(Some("aitopia"), None, None, None)
+            .unwrap();
         std::env::remove_var("OPENAI_MODEL");
         std::env::remove_var("OPENAI_API_KEY");
         assert_eq!(a.model, "env-model");
-        assert_eq!(a.sources.get("model").map(String::as_str), Some("environment"));
+        assert_eq!(
+            a.sources.get("model").map(String::as_str),
+            Some("environment")
+        );
         assert_eq!(a.sources.get("base_url").map(String::as_str), Some("none"));
     }
 
@@ -492,17 +639,35 @@ mod tests {
         let mut cfg = Config::default();
         cfg.providers.insert(
             "p".into(),
-            Provider { base_url: "https://cfg.example/v1".into(), api_key: String::new(), model: "cfg-model".into(), ..Default::default() },
+            Provider {
+                base_url: "https://cfg.example/v1".into(),
+                api_key: String::new(),
+                model: "cfg-model".into(),
+                ..Default::default()
+            },
         );
         std::env::set_var("OPENAI_API_KEY", "env-key");
-        let a = cfg.resolve_active(Some("p"), Some("https://cli.example/v1"), None, None).unwrap();
+        let a = cfg
+            .resolve_active(Some("p"), Some("https://cli.example/v1"), None, None)
+            .unwrap();
         std::env::remove_var("OPENAI_API_KEY");
 
-        assert_eq!(a.sources.get("base_url").map(String::as_str), Some("command line"));
-        assert_eq!(a.sources.get("api_key").map(String::as_str), Some("environment"));
-        assert_eq!(a.sources.get("model").map(String::as_str), Some("config file"));
+        assert_eq!(
+            a.sources.get("base_url").map(String::as_str),
+            Some("command line")
+        );
+        assert_eq!(
+            a.sources.get("api_key").map(String::as_str),
+            Some("environment")
+        );
+        assert_eq!(
+            a.sources.get("model").map(String::as_str),
+            Some("config file")
+        );
         // No key material leaks into the source map.
-        assert!(!serde_json::to_string(&a.sources).unwrap().contains("env-key"));
+        assert!(!serde_json::to_string(&a.sources)
+            .unwrap()
+            .contains("env-key"));
     }
 
     #[test]
@@ -551,8 +716,10 @@ mod tests {
         let back: Config = toml::from_str(&raw).unwrap();
         assert_eq!(back.profiles["fast"].provider.as_deref(), Some("groq"));
         // approval_mode (old key) still deserializes into approval_policy.
-        let legacy: Config =
-            toml::from_str("[profiles.x]\napproval_mode = \"suggest\"").unwrap();
-        assert_eq!(legacy.profiles["x"].approval_policy.as_deref(), Some("suggest"));
+        let legacy: Config = toml::from_str("[profiles.x]\napproval_mode = \"suggest\"").unwrap();
+        assert_eq!(
+            legacy.profiles["x"].approval_policy.as_deref(),
+            Some("suggest")
+        );
     }
 }

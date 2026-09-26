@@ -612,7 +612,21 @@ pub static HACKER: Theme = Theme {
     overlay: Color::Black,
 };
 
-pub static ALL: &[&Theme] = &[&LAUDA, &CHERRY, &MIDNIGHT, &NORD, &DRACULA, &MONOKAI, &SOLARIZED, &GRUVBOX, &TOKYO, &EVERFOREST, &EMBER, &ICE, &HACKER];
+pub static ALL: &[&Theme] = &[
+    &LAUDA,
+    &CHERRY,
+    &MIDNIGHT,
+    &NORD,
+    &DRACULA,
+    &MONOKAI,
+    &SOLARIZED,
+    &GRUVBOX,
+    &TOKYO,
+    &EVERFOREST,
+    &EMBER,
+    &ICE,
+    &HACKER,
+];
 pub static DEFAULT: &Theme = &LAUDA;
 
 pub fn names() -> Vec<&'static str> {
@@ -626,7 +640,10 @@ pub fn get() -> &'static Theme {
 
 /// Switch the active theme by name. Returns false for unknown names.
 pub fn set(name: &str) -> bool {
-    let found = ALL.iter().find(|t| t.name.eq_ignore_ascii_case(name.trim())).copied();
+    let found = ALL
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(name.trim()))
+        .copied();
     // A failed lookup must leave the current choice untouched.
     if let Some(t) = found {
         ACTIVE.with(|c| *c.borrow_mut() = Some(t));
@@ -645,7 +662,11 @@ pub fn banner_gradient(rows: usize) -> Vec<Color> {
     let stops = [top, mid, bot];
     let mut out = Vec::with_capacity(rows);
     for i in 0..rows {
-        let pos = if rows <= 1 { 0.0 } else { i as f32 / (rows - 1) as f32 };
+        let pos = if rows <= 1 {
+            0.0
+        } else {
+            i as f32 / (rows - 1) as f32
+        };
         let seg = (pos * 2.0).min(1.999);
         let idx = seg as usize;
         let t = seg - idx as f32;
@@ -663,7 +684,11 @@ fn lerp(a: Color, b: Color, t: f32) -> Color {
         ),
         _ => {
             // Named colors can't lerp — snap halfway.
-            if t < 0.5 { a } else { b }
+            if t < 0.5 {
+                a
+            } else {
+                b
+            }
         }
     }
 }

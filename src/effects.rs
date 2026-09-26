@@ -246,7 +246,10 @@ impl Engine {
         for (idx, p) in self.parts.iter_mut().enumerate() {
             p.y += p.vy;
             p.phase += 0.08 * p.sway;
-            if matches!(self.kind, EffectKind::Snow | EffectKind::Petals | EffectKind::Confetti) {
+            if matches!(
+                self.kind,
+                EffectKind::Snow | EffectKind::Petals | EffectKind::Confetti
+            ) {
                 p.x += p.sway * 0.35 * p.phase.sin();
             }
             if self.kind == EffectKind::Fireflies {
@@ -316,8 +319,7 @@ impl Engine {
                     self.flash = 3;
                     // Next strike in 3–12 seconds of ticks (~30 ticks/s? no —
                     // ~10/s → 30–120 ticks).
-                    self.ticks_until_strike =
-                        30 + (self.rng.next() % 90) as u32;
+                    self.ticks_until_strike = 30 + (self.rng.next() % 90) as u32;
                 }
             }
         }
@@ -353,7 +355,9 @@ impl Engine {
             if row < area.y || col < area.x {
                 continue;
             }
-            let Some(cell) = buf.cell_mut((col, row)) else { continue };
+            let Some(cell) = buf.cell_mut((col, row)) else {
+                continue;
+            };
             cell.set_symbol(self.glyph(p.variant));
             cell.set_style(style_for(p.variant));
         }
@@ -536,8 +540,16 @@ mod tests {
             a.tick();
             b.tick();
         }
-        let pa: Vec<(u32, u32)> = a.parts.iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect();
-        let pb: Vec<(u32, u32)> = b.parts.iter().map(|p| (p.x.to_bits(), p.y.to_bits())).collect();
+        let pa: Vec<(u32, u32)> = a
+            .parts
+            .iter()
+            .map(|p| (p.x.to_bits(), p.y.to_bits()))
+            .collect();
+        let pb: Vec<(u32, u32)> = b
+            .parts
+            .iter()
+            .map(|p| (p.x.to_bits(), p.y.to_bits()))
+            .collect();
         assert_eq!(pa, pb);
     }
 
@@ -583,7 +595,6 @@ mod tests {
         e.render(&mut buf, area);
         assert!(buf.content().iter().all(|c| c.symbol() == " "));
     }
-
 
     #[test]
     fn new_effect_names_parse() {
@@ -675,9 +686,19 @@ mod tests {
             let known = crate::theme::get();
             for color in used {
                 let themed = [
-                    known.accent, known.accent2, known.warning, known.bullet,
-                    known.user, known.heading, known.dim, known.gray,
-                    known.text, known.success, known.string, known.error, known.mac,
+                    known.accent,
+                    known.accent2,
+                    known.warning,
+                    known.bullet,
+                    known.user,
+                    known.heading,
+                    known.dim,
+                    known.gray,
+                    known.text,
+                    known.success,
+                    known.string,
+                    known.error,
+                    known.mac,
                 ]
                 .contains(&color);
                 assert!(

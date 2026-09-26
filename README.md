@@ -22,30 +22,37 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 
 ## Features
 
-- ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small static-ish binary, perfect for Android/Termux
+- ⚡ **Pure Rust + Tokio + reqwest (rustls)** — one small static-ish binary, for Android/Termux
 - 🔌 **Any OpenAI-compatible endpoint** — custom `base_url` / `api_key` / `model`
-- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `web_search`, `grep`, `glob`, `update_plan`
-- ⚙️ **Managed processes** — `start_process` / `poll_process` / `write_process` / `stop_process`: run dev servers, watchers and REPL-style programs across tool calls. Up to 16 per agent; latest 8 KiB per output stream, stdin + EOF, and process-group cleanup on stop/exit. Plain pipes (not a PTY); processes do not survive session resume. Stop finished jobs to free their slots.
-- 🌐 **Web built in** — fetch documentation **and search the web** (`web_search`, DuckDuckGo) from the agent
-- 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto` (+ hard confirmation for dangerous commands)
-- 🖼️ **Image input** — attach screenshots or photos for vision models (`-i`, `/image`)
-- 📡 **Streaming responses** with reasoning-model support (dimmed "thinking" indicator)
-- 🎨 **13 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice, hacker (`/theme`, persisted)
-- ✨ **Ambient effects** — cherry petals 🌸, rain, snow, matrix rain, lightning ⚡, stars, fireflies, bubbles, embers, confetti, meteor comets, aurora (`/effect`, rendered in the banner only)
-- 🌈 **Syntax highlighting** — code blocks and diffs colored per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
-- ⌨️ **Prompt history** — ↑/↓ recall with draft restore; persisted across sessions
-- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`… plus `@file` mentions, `#note` memories and `!<cmd>` shell passthrough
-- 📁 **`@file` attachment** — mention a file in any prompt and its contents are inlined automatically; `@dir/` picks files via a picker
-- ↩️ **Multi-turn undo** — `/undo N` reverts file changes from the last N agent turns
-- 🔎 **Session cost tracking** — cumulative tokens + estimated USD cost in `/status` and the dashboard
-- 📱 **Adaptive mobile UI** — full banner art collapses to a slim one-line header on small Termux screens; a compact summary bar and auto-trimmed hints keep things usable in portrait
-- 👆 **Touch-native** — swipe to scroll, tap picker rows to choose, tap the composer to move the caret; fully navigable by touch on Termux
-- 🛠️ **Live activity feedback** — footer indicator shows what the agent is doing (`reasoning`, `streaming`, `running <tool>`) plus elapsed time
-- 📄 **AGENTS.md support** — project instructions auto-loaded into context (`/init` generates one)
-- 👤 **Profiles** — named presets in `[profiles.<name>]`, activated with `--profile`
-- 💾 **Session persistence** — autosaved; resume with `--continue` or `/resume`
+- 🧠 **Agentic tool loop** — `list_dir`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `fetch_url`, `web_search`, `grep`, `glob`, `git`, `update_plan`
+- 🔎 **Regex search** — `grep` is literal by default, pass `"regex": true` for a pattern; honors `ignore_case`, `context`, and has a compiled-size cap
+- 📊 **Read-only git** — one `git` tool, fixed allowlist (`status`, `log`, `diff`, `show`, `blame`), direct argv, no shell
+- 🪝 **Post-edit hooks** — `[hooks] post_edit` runs formatters/linters/tests after every file mutation; exit status and output go back to the model
+- 💸 **Token & cost guardrails** — `[limits] max_tokens` / `max_cost_usd`; `/status` shows what's left
+- 🧾 **Structured logs** — optional JSONL trail of tool calls, usage, hook results, budget blocks; never prompts or file contents
+- 🌐 **Proxy & custom CAs** — `[network] proxy` (http/https/socks5), `ca_bundle`, explicit `insecure`
+- 🚦 **Patient about flaky networks** — up to 5 retries by default on dropped connections and 408/409/429/5xx, jittered exponential backoff honoring `Retry-After`. Waits show in the status line, `Esc` cancels instantly, tune with `[limits] max_retries`
+- ⚙️ **Managed processes** — `start_process` / `poll_process` / `write_process` / `stop_process` for dev servers, watchers, REPLs; 16 per agent, 8 KiB per stream, process-group cleanup
+- 🌐 **Web built in** — `fetch_url` plus `web_search` (DuckDuckGo)
+- 🛡️ **Approval modes** — `suggest`, `auto-edit`, `full-auto`, with confirmation for dangerous commands
+- 🖼️ **Image input** — screenshots and photos for vision models (`-i`, `/image`)
+- 📡 **Streaming responses** with reasoning-model support
+- 🎨 **13 color themes** — lauda, cherry, midnight, nord, dracula, monokai, solarized, gruvbox, tokyo, everforest, ember, ice, hacker (`/theme`)
+- ✨ **Ambient effects** — petals, rain, snow, matrix rain, lightning, stars, fireflies, bubbles, embers, confetti, comets, aurora (`/effect`, banner only)
+- 🌈 **Syntax highlighting** — code blocks and diffs, per language (rust, python, js/ts, go, c/cpp, java, sh, toml, yaml, json)
+- ⌨️ **Prompt history** — ↑/↓ recall with draft restore, persisted
+- 💬 **Slash commands & input sugar** — `/provider`, `/model`, `/diff`, `/review`, `/undo`, `/compact`, `/init`, `/status`, `/export`, `/resume`, `/retry`…, plus `@file`, `#note` and `!<cmd>`
+- ↩️ **Multi-turn undo** — `/undo N` reverts the last N agent turns
+- 🔎 **Session cost tracking** — cumulative tokens and estimated USD in `/status`
+- 📱 **Adaptive mobile UI** — banner art collapses to a one-line header on small screens
+- 👆 **Touch-native** — swipe to scroll, tap picker rows, tap the composer to move the caret
+- 🛠️ **Live activity feedback** — footer shows `reasoning` / `streaming` / `running <tool>` plus elapsed time
+- 📄 **AGENTS.md support** — project instructions auto-loaded (`/init` generates one)
+- 👤 **Profiles** — named presets in `[profiles.<name>]`, via `--profile`
+- 💾 **Session persistence** — `--continue`, `--resume <id>`, `/resume`; ids, unique prefixes and names all work
+- 🌿 **Checkpoints & branching** — `/checkpoint [label]`, `/checkpoints`, `/branch <n|id>`
 - 🖥️ **One-shot mode** — `laudacode exec "fix the failing test"`
-- 📦 **JSON output** — `--json` emits machine-readable event lines for scripting
+- 📦 **JSON output** — `--json` emits machine-readable event lines
 
 ## Install
 
@@ -55,17 +62,10 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
 ```
 
-Always installs the **latest GitHub release** (auto-detected), builds it
-on-device and installs `laudacode` into `$PREFIX/bin` — no sudo inside Termux,
-works the same on Linux and macOS. Prerequisites: `curl`, `tar`, `rust`
-(Termux: `pkg install curl tar rust`).
-
-Environment overrides (e.g. pin an older release):
-
-```sh
-LAUDACODE_VERSION=v0.2.0 PREFIX=$PREFIX \
-    curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
-```
+Installs the **latest GitHub release** (auto-detected), builds it on-device and
+puts `laudacode` in `$PREFIX/bin` — no sudo inside Termux. Needs `curl`, `tar`,
+`rust` (Termux: `pkg install curl tar rust`). Pin an older release with
+`LAUDACODE_VERSION=v0.2.0`.
 
 ### Termux / Android (manual)
 
@@ -77,8 +77,7 @@ cargo build --release
 cp target/release/laudacode $PREFIX/bin/
 ```
 
-> Building on low-RAM phones? Reduce codegen pressure:
-> `CARGO_PROFILE_RELEASE_LTO=off cargo build --release`
+> Low-RAM phone? `CARGO_PROFILE_RELEASE_LTO=off cargo build --release`
 
 ### Linux / macOS
 
@@ -98,25 +97,17 @@ export OPENAI_MODEL="stealth/ox-alpha"
 laudacode                                     # interactive REPL
 ```
 
-Or skip env vars entirely and configure from inside the TUI:
+Or skip env vars and configure from inside the TUI: first run has no wizard,
+just type `/provider`. It opens an interactive menu (**add · use · edit · list**):
+pick **add**, choose a preset (openrouter, tokenrouter, openai, groq, deepseek,
+together, ollama, ollamacloud, lmstudio…), paste your key, pick a model from the
+live catalog. Nothing is saved until a live test request proves key and model
+work — same rule for the CLI flow.
 
-```sh
-laudacode                 # first run: no wizard — just type /provider
-```
-
-`/provider` opens a fully interactive menu (**add · use · edit · list**):
-choose **add** → pick a preset (openrouter, tokenrouter, openai,
-groq, deepseek, together, ollama, ollamacloud, lmstudio…) → paste your API key → pick a model
-from the live catalog. Nothing is saved until a real test request proves
-the key and model work. The CLI flow is still there too — same rule: a provider is only saved
-after a live test request proves the key and model work.
-
-**Keyless free providers** — the `powerbrain` and `aitopia` presets need no
-API key and no model picker: picking them saves immediately with a built-in
-default model (gpt-5 and gpt-4o-mini class respectively). Use them with
-`--provider` or `/provider use`. `powerbrain` is also the built-in default:
-with no provider configured at all, Laudacode just works out of the box
-chat-first.
+**Keyless free providers** — `powerbrain` and `aitopia` need no API key and no
+model picker: picking one saves immediately with a built-in default model.
+`powerbrain` is the built-in default, so with nothing configured Laudacode works
+out of the box, chat-first.
 
 ```sh
 laudacode provider add                        # guided setup (name, url, key, model)
@@ -135,8 +126,6 @@ laudacode exec "add input validation to src/main.rs" --mode full-auto
 ## Configuration
 
 Precedence: **CLI flags > profile (`--profile`) > environment variables > config file**.
-
-Environment variables:
 
 | Variable         | Meaning                    |
 |------------------|----------------------------|
@@ -163,14 +152,37 @@ model    = "stealth/ox-alpha"
 [profiles.fast]                       # optional presets → laudacode --profile fast
 provider = "groq"
 model    = "llama-3.3-70b-versatile"
+
+[limits]                              # stop runaway loops
+max_tokens   = 500000
+max_cost_usd = 5.0
+
+[hooks]                               # run after every file mutation
+post_edit = ["cargo fmt", "cargo clippy --quiet -- -D warnings"]
+post_edit_timeout_secs = 30
+
+[logging]                             # JSONL trail, no prompts or file contents
+enabled = true                        # no `file` → stderr
+file  = "~/.local/share/laudacode/session.jsonl"
+
+[network]                             # applies to every outgoing request
+proxy     = "http://127.0.0.1:8080"  # http / https / socks5
+ca_bundle = "~/.config/laudacode/corp.pem"
+# insecure = true                     # skip TLS verification (risky)
 ```
 
-See [`config.example.toml`](config.example.toml) for presets (OpenAI,
-OpenRouter, Groq, DeepSeek, Ollama, Ollama Cloud, LM Studio).
+Post-edit hooks get the touched paths in `$LAUDACODE_CHANGED_FILES`
+(space-separated). Each hook's exit status and first output line go back to the
+model, so a failing test run is something it can see and fix. Only
+file-mutating tools trigger them.
+
+Provider presets (OpenAI, OpenRouter, Groq, DeepSeek, Ollama, Ollama Cloud,
+LM Studio) and annotated versions of every block above:
+[`config.example.toml`](config.example.toml).
 
 ## Approval modes
 
-Default mode is **BUILD** (`auto-edit`).
+Default is **BUILD** (`auto-edit`).
 
 | `--mode` value          | TUI label  | File edits | Shell commands | Dangerous commands |
 |--------------------------|------------|------------|----------------|--------------------|
@@ -178,8 +190,8 @@ Default mode is **BUILD** (`auto-edit`).
 | `auto-edit` *(default)*  | BUILD      | ✅ auto    | ask            | ask                |
 | `full-auto` (alias `yolo`)| FULL AUTO | ✅ auto    | ✅ auto        | ask (always)       |
 
-You can also answer `[a]always` on any prompt to auto-approve the rest of the
-session. In the TUI, switch modes any time with the `/approvals` picker or **Tab**.
+Answer `[a]always` on any prompt to auto-approve the rest of the session. In the
+TUI, switch modes any time with `/approvals` or **Tab**.
 
 ## CLI reference
 
@@ -195,6 +207,8 @@ laudacode --base-url http://localhost:11434/v1 --api-key ollama --model qwen2.5-
 laudacode -c                       # continue last session
 laudacode -y                       # shorthand for --mode full-auto
 laudacode provider add|list|use|edit|remove <name>
+laudacode session checkpoints <id>            # list a session's checkpoints
+laudacode session branch <id> <checkpoint>     # fork a new session from one
 ```
 
 ## Slash commands
@@ -207,7 +221,11 @@ laudacode provider add|list|use|edit|remove <name>
 | `/provider …`        | manage providers (`add` `list` `show` `use <name>`) |
 | `/theme`             | switch color theme (live preview)            |
 | `/effect`            | ambient effects (petals · rain · lightning…) |
-| `/status`            | provider/model/session + token & cost totals |
+| `/status`            | provider/model/session + token, cost, budget, hook, log & network state |
+| `/session …`         | `rename` · `search` · `list` · `delete` sessions |
+| `/checkpoint [label]`| snapshot the conversation as a branch point    |
+| `/checkpoints`       | list this session's checkpoints                |
+| `/branch <n\|id>`    | fork a new session from a checkpoint           |
 | `/skills`            | searchable picker — pick a skill to stage it in the composer |
 | `/diff`              | git diff of working tree                     |
 | `/review`            | AI review of the current git diff            |
@@ -232,18 +250,10 @@ Input prefixes:
 Keys: type `/` for autocomplete, `↑/↓` + `Tab`/`Enter` to complete,
 `Ctrl+O` expands recent tool output, `Esc` interrupts the agent.
 
-**Touch / mouse** — fully touch-navigable: swipe or wheel to scroll the
-transcript, **tap a picker row** to choose it (models, themes, sessions,
-providers…), and **tap inside the composer** to move the caret to that
-position. `Ctrl+B` toggles the banner and the hint strip under the composer
-adapts to narrow windows automatically.
-
-## Why Rust?
-
-Typical coding agents drag in Node.js and hundreds of megabytes of runtime.
-On Android that is painful. Laudacode compiles to a small native executable
-(~3–8 MB stripped) with zero runtime dependencies — instant startup, minimal
-battery and RAM usage.
+**Touch / mouse** — swipe or wheel to scroll the transcript, **tap a picker row**
+to choose it (models, themes, sessions, providers…), and **tap inside the
+composer** to move the caret to that position. `Ctrl+B` toggles the banner, and
+the hint strip under the composer adapts to narrow windows automatically.
 
 ## License
 

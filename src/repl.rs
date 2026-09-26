@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use crate::agent::{Agent, AgentEvent, ApprovalMode, UiSink};
 use crate::api::{ChatClient, Message};
+use crate::budget;
 use crate::config::{sanitize_name, ActiveProvider, Config, Provider};
 use crate::session::Session;
-use crate::tui::{self as tuiapp, Action as KeyAction, Entry, Tui};
 use crate::tools::{self, Action};
+use crate::tui::{self as tuiapp, Action as KeyAction, Entry, Tui};
 
 // ---------------------------------------------------------------------------
 // Plain terminal UI sink (used by `exec` mode)
@@ -31,7 +32,13 @@ pub struct TermUi {
 impl TermUi {
     pub fn new() -> Result<Self> {
         let rl = DefaultEditor::new()?;
-        Ok(Self { rl, approve_all: false, in_reasoning: false, reasoning_bytes: 0, json_out: false })
+        Ok(Self {
+            rl,
+            approve_all: false,
+            in_reasoning: false,
+            reasoning_bytes: 0,
+            json_out: false,
+        })
     }
 
     fn emit_json(kind: &str, data: &str) {
@@ -64,7 +71,8 @@ impl UiSink for TermUi {
                     println!("{obj}");
                 }
                 AgentEvent::ToolEdit { name, files } => {
-                    let obj = serde_json::json!({ "type": "tool_edit", "tool": name, "files": files });
+                    let obj =
+                        serde_json::json!({ "type": "tool_edit", "tool": name, "files": files });
                     println!("{obj}");
                 }
                 AgentEvent::Usage(u) => {
@@ -78,6 +86,10 @@ impl UiSink for TermUi {
                 }
                 AgentEvent::Todo(todos) => {
                     let obj = serde_json::json!({ "type": "plan", "steps": todos });
+                    println!("{obj}");
+                }
+                AgentEvent::Notice(msg) => {
+                    let obj = serde_json::json!({ "type": "notice", "message": msg });
                     println!("{obj}");
                 }
             }
@@ -109,6 +121,10 @@ impl UiSink for TermUi {
                 println!("{}", format!("· {name}: {summary}").dark_grey());
                 let _ = std::io::stdout().flush();
             }
+            AgentEvent::Notice(msg) => {
+                println!("{}", format!("· {msg}").yellow());
+                let _ = std::io::stdout().flush();
+            }
             AgentEvent::ToolEdit { name, files } => {
                 use crossterm::style::{Color as CT, Stylize as _};
                 for f in &files {
@@ -122,8 +138,12 @@ impl UiSink for TermUi {
                         let line = match l.kind {
                             crate::diff::LineKind::Add => l.text.clone().with(CT::Green),
                             crate::diff::LineKind::Del => l.text.clone().with(CT::Red),
-                            crate::diff::LineKind::Meta => format!("  {text}", text = l.text).with(CT::Blue).italic(),
-                            crate::diff::LineKind::Ctx => l.text.clone().dark_grey().to_string().dark_grey(),
+                            crate::diff::LineKind::Meta => {
+                                format!("  {text}", text = l.text).with(CT::Blue).italic()
+                            }
+                            crate::diff::LineKind::Ctx => {
+                                l.text.clone().dark_grey().to_string().dark_grey()
+                            }
                         };
                         println!("│{line}");
                     }
@@ -142,7 +162,9 @@ impl UiSink for TermUi {
     }
 
     fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
-        Box::new(TermSubUi { prefix: prefix.to_string() })
+        Box::new(TermSubUi {
+            prefix: prefix.to_string(),
+        })
     }
 
     fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
@@ -193,15 +215,30 @@ impl UiSink for TermSubUi {
         match ev {
             AgentEvent::Content(d) => print!("{}{d}", format!("{} ", self.prefix).dark_grey()),
             AgentEvent::ToolStart { name, summary } => {
-                println!("{}", format!("· {prefix}{name}: {summary}", prefix = self.prefix).dark_grey());
+                println!(
+                    "{}",
+                    format!("· {prefix}{name}: {summary}", prefix = self.prefix).dark_grey()
+                );
+            }
+            AgentEvent::Notice(msg) => {
+                println!(
+                    "{}",
+                    format!("· {prefix}{msg}", prefix = self.prefix).yellow()
+                );
             }
             AgentEvent::ToolEdit { files, .. } => {
                 use crossterm::style::{Color as CT, Stylize as _};
                 for f in &files {
                     println!(
                         "{}",
-                        format!("┌─ [{p}] {path} (+{a} −{r})", p = self.prefix, path = f.path, a = f.added, r = f.removed)
-                            .with(CT::Cyan)
+                        format!(
+                            "┌─ [{p}] {path} (+{a} −{r})",
+                            p = self.prefix,
+                            path = f.path,
+                            a = f.added,
+                            r = f.removed
+                        )
+                        .with(CT::Cyan)
                     );
                 }
             }
@@ -230,7 +267,9 @@ impl UiSink for TermSubUi {
     }
 
     fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
-        Box::new(TermSubUi { prefix: format!("{}>{prefix}", self.prefix) })
+        Box::new(TermSubUi {
+            prefix: format!("{}>{prefix}", self.prefix),
+        })
     }
 }
 
@@ -249,15 +288,29 @@ pub enum WorkerEvent {
     Error(String),
     /// Conversation was replaced (resume) — TUI must clear its transcript
     /// and replay the restored messages under the new session identity.
-    Reload { text: String, entries: Vec<Entry>, session_id: String, session_name: Option<String> },
+    Reload {
+        text: String,
+        entries: Vec<Entry>,
+        session_id: String,
+        session_name: Option<String>,
+    },
     /// Final state sent right before the worker exits, so the shell
     /// goodbye can offer an exact `--resume <id>` command.
-    SessionSummary { id: String, messages: usize },
+    SessionSummary {
+        id: String,
+        messages: usize,
+    },
     /// Generic picker: model lists, resume lists, approval modes…
-    Pick { title: String, items: Vec<String> },
+    Pick {
+        title: String,
+        items: Vec<String>,
+    },
     /// The active endpoint changed (model switch, provider switch or a fresh
     /// `/provider add`) — the dashboard must re-render model/provider.
-    ProviderSwitched { provider: String, model: String },
+    ProviderSwitched {
+        provider: String,
+        model: String,
+    },
     /// The current session got (re)named — dashboard shows it live.
     SessionName(String),
     /// A session was deleted — a status line can confirm it.
@@ -294,6 +347,12 @@ pub enum WorkerCmd {
     Undo(usize),
     /// Replace the live conversation with a stored session id.
     ResumeSession(String),
+    /// Snapshot the live conversation as a branch point (`/checkpoint`).
+    Checkpoint(Option<String>),
+    /// List this session's checkpoints (`/checkpoints`).
+    ListCheckpoints,
+    /// Branch a new session from a checkpoint and switch to it (`/branch`).
+    BranchCheckpoint(String),
     /// Rename the current session.
     RenameSession(String),
     /// List sessions matching a keyword (id or name) as a picker.
@@ -304,7 +363,10 @@ pub enum WorkerCmd {
     QueueImage(String),
     /// Authenticated model-catalog fetch for `/provider add` (key already
     /// captured). Replies with a models picker or SetupModelsFailed.
-    SetupListModels { base_url: String, api_key: String },
+    SetupListModels {
+        base_url: String,
+        api_key: String,
+    },
     /// Persist + activate a provider created by the in-TUI `/provider add`.
     FinishProviderSetup {
         name: String,
@@ -318,9 +380,15 @@ pub enum WorkerCmd {
     /// its model (`/provider edit`).
     EditProviderPickModel(String),
     /// Persist a new default model for a configured provider.
-    EditProviderSetModel { provider: String, model: String },
+    EditProviderSetModel {
+        provider: String,
+        model: String,
+    },
     /// Replace the stored API key of a configured provider.
-    FinishEditApiKey { provider: String, api_key: String },
+    FinishEditApiKey {
+        provider: String,
+        api_key: String,
+    },
     /// Persist the chosen color theme.
     SetTheme(String),
     /// Persist the chosen ambient effect.
@@ -339,15 +407,6 @@ pub enum ProviderMenu {
 /// reality (hidden/experimental models like `stealth/ox-alpha` work by id
 /// long before they appear in /models), so typing an id must always win.
 pub const MANUAL_MODEL_ITEM: &str = "(+ type a model name instead)";
-
-/// Rough session cost in USD from cumulative prompt/completion tokens.
-/// Heuristic ~ GPT-4o-mini-class pricing: $0.15 / 1M input, $0.60 / 1M output.
-pub fn estimate_cost(prompt_tokens: u64, completion_tokens: u64) -> f64 {
-    const IN_PER_1M: f64 = 0.15;
-    const OUT_PER_1M: f64 = 0.60;
-    (prompt_tokens as f64 / 1_000_000.0) * IN_PER_1M
-        + (completion_tokens as f64 / 1_000_000.0) * OUT_PER_1M
-}
 
 #[derive(Clone)]
 struct WorkerBridge {
@@ -374,11 +433,14 @@ impl UiSink for WorkerBridge {
     /// Each concurrent sub-agent gets its own bridge sharing the same
     /// channels; approval requests queue up in the single TUI modal.
     fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
-        Box::new(SubBridge { inner: WorkerBridge {
-            tx: self.tx.clone(),
-            approve_rx: self.approve_rx.clone(),
-            cancel: self.cancel.clone(),
-        }, prefix: format!("[{prefix}] ") })
+        Box::new(SubBridge {
+            inner: WorkerBridge {
+                tx: self.tx.clone(),
+                approve_rx: self.approve_rx.clone(),
+                cancel: self.cancel.clone(),
+            },
+            prefix: format!("[{prefix}] "),
+        })
     }
 }
 
@@ -436,7 +498,12 @@ pub fn spawn_worker(app: App) -> WorkerHandle {
         .spawn(move || worker_main(app, ev_tx, cmd_rx, approve_rx, worker_cancel))
         .expect("spawning agent worker thread");
 
-    WorkerHandle { cmd: cmd_tx, approve: approve_tx, events: ev_rx, cancel }
+    WorkerHandle {
+        cmd: cmd_tx,
+        approve: approve_tx,
+        events: ev_rx,
+        cancel,
+    }
 }
 
 fn worker_main(
@@ -468,15 +535,24 @@ fn worker_main(
                 app.persist();
                 let _ = ev_tx.send(WorkerEvent::SessionSummary {
                     id: app.session.id.clone(),
-                    messages: app.agent.messages.iter().filter(|m| m.role != "system").count(),
+                    messages: app
+                        .agent
+                        .messages
+                        .iter()
+                        .filter(|m| m.role != "system")
+                        .count(),
                 });
                 break;
             }
             WorkerCmd::Submit(text) => {
                 if let Some(memory) = text.strip_prefix('#') {
                     match add_memory(&app.cwd, memory) {
-                        Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Info(msg)); }
-                        Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
+                        Ok(msg) => {
+                            let _ = ev_tx.send(WorkerEvent::Info(msg));
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                        }
                     }
                     continue;
                 }
@@ -504,9 +580,8 @@ fn worker_main(
                     Ok(s) => {
                         app.persist();
                         let preview: String = s.chars().take(400).collect();
-                        let _ = ev_tx.send(WorkerEvent::Info(format!(
-                            "context compacted:\n{preview}"
-                        )));
+                        let _ =
+                            ev_tx.send(WorkerEvent::Info(format!("context compacted:\n{preview}")));
                     }
                     Err(e) => {
                         let _ = ev_tx.send(WorkerEvent::Error(e.to_string()));
@@ -534,8 +609,7 @@ fn worker_main(
                         });
                     }
                     Err(e) => {
-                        let _ =
-                            ev_tx.send(WorkerEvent::Error(format!("listing models: {e:#}")));
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("listing models: {e:#}")));
                     }
                 }
                 let _ = ev_tx.send(WorkerEvent::Busy(false));
@@ -570,29 +644,26 @@ fn worker_main(
             WorkerCmd::SetApprovalMode(mode) => {
                 app.agent.mode = mode;
             }
-            WorkerCmd::UseProvider(name) => match switch_to(
-                &mut app.config,
-                &mut app.agent,
-                &name,
-                &app.cwd,
-            ) {
-                Ok(active) => {
-                    // Keep App state in sync so /status and the dashboard
-                    // reflect the switch immediately.
-                    app.active = active;
-                    let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
-                        provider: name.clone(),
-                        model: app.agent.model.clone(),
-                    });
-                    let _ = ev_tx.send(WorkerEvent::Info(format!(
-                        "switched to '{name}' — model {}",
-                        app.agent.model
-                    )));
+            WorkerCmd::UseProvider(name) => {
+                match switch_to(&mut app.config, &mut app.agent, &name, &app.cwd) {
+                    Ok(active) => {
+                        // Keep App state in sync so /status and the dashboard
+                        // reflect the switch immediately.
+                        app.active = active;
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(format!(
+                            "switched to '{name}' — model {}",
+                            app.agent.model
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
                 }
-                Err(e) => {
-                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
-                }
-            },
+            }
             WorkerCmd::ListProviders => {
                 let mut lines = String::new();
                 for (n, p) in &app.config.providers {
@@ -610,9 +681,7 @@ fn worker_main(
             }
             WorkerCmd::ShowProvider => {
                 let a = &app.active;
-                let src = |f: &str| {
-                    a.sources.get(f).map(String::as_str).unwrap_or("none")
-                };
+                let src = |f: &str| a.sources.get(f).map(String::as_str).unwrap_or("none");
                 let mut lines = format!(
                     "provider : {}\nbase_url : {} (from: {})\nmodel    : {} (from: {})\napi_key  : set (from: {})\nconfig   : {}\n",
                     a.name,
@@ -635,7 +704,10 @@ fn worker_main(
             }
             WorkerCmd::Export => match export_transcript(&app) {
                 Ok(path) => {
-                    let _ = ev_tx.send(WorkerEvent::Info(format!("transcript saved to {}", path.display())));
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "transcript saved to {}",
+                        path.display()
+                    )));
                 }
                 Err(e) => {
                     let _ = ev_tx.send(WorkerEvent::Error(format!("export failed: {e:#}")));
@@ -659,7 +731,12 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         approve_rx: approve_rx.clone(),
                         cancel: cancel.clone(),
                     };
-                    match rt.block_on(app.agent.run_turn(INIT_PROMPT, &[], &mut bridge, Some(&cancel))) {
+                    match rt.block_on(app.agent.run_turn(
+                        INIT_PROMPT,
+                        &[],
+                        &mut bridge,
+                        Some(&cancel),
+                    )) {
                         Ok(()) => {
                             app.persist();
                             let msg = if app.cwd.join("AGENTS.md").exists() {
@@ -690,7 +767,10 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         dirs[0].display()
                     )));
                 } else {
-                    let _ = ev_tx.send(WorkerEvent::Pick { title: "skills".into(), items });
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "skills".into(),
+                        items,
+                    });
                 }
             }
             WorkerCmd::Status => {
@@ -701,25 +781,94 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     ApprovalMode::FullAuto => "FULL AUTO",
                 };
                 let src = |f: &str| {
-                    app.active.sources.get(f).map(String::as_str).unwrap_or("none")
+                    app.active
+                        .sources
+                        .get(f)
+                        .map(String::as_str)
+                        .unwrap_or("none")
                 };
                 let usage = match a.last_usage {
-                    Some(u) => format!("ctx {} tok · out {} tok", u.prompt_tokens, u.completion_tokens),
+                    Some(u) => format!(
+                        "ctx {} tok · out {} tok",
+                        u.prompt_tokens, u.completion_tokens
+                    ),
                     None => "no requests yet".to_string(),
                 };
                 let (tp, tc) = a.tot_usage;
-                let est = estimate_cost(tp, tc);
+                let est = a.session_cost();
                 let total = if tp + tc == 0 {
                     "no tokens yet".to_string()
                 } else {
-                    format!(
-                        "~{:.3}k tok · est ${:.4}",
-                        (tp + tc) as f64 / 1000.0,
-                        est
-                    )
+                    format!("~{:.3}k tok · est ${:.4}", (tp + tc) as f64 / 1000.0, est)
+                };
+                // Guardrails + observability, so the user can see the ceilings
+                // and whether the structured log is actually running.
+                let budget = if a.limits.max_tokens.is_none() && a.limits.max_cost_usd.is_none() {
+                    "no limits set".to_string()
+                } else {
+                    let cap_t = a
+                        .limits
+                        .max_tokens
+                        .map(|m| format!(" / {m} tok"))
+                        .unwrap_or_default();
+                    let cap_c = a
+                        .limits
+                        .max_cost_usd
+                        .map(|m| format!(" / ${m}"))
+                        .unwrap_or_default();
+                    format!("{tp}+{tc} tok{cap_t}{cap_c}")
+                };
+                // How many times a transient failure is retried before the
+                // turn is failed for good.
+                let retries = format!(
+                    "{} ({} attempts)",
+                    a.client.max_retries(),
+                    a.client.max_retries() + 1
+                );
+                let hooks = if app.config.hooks.post_edit.is_empty() {
+                    "none".to_string()
+                } else {
+                    app.config.hooks.post_edit.join(" · ")
+                };
+                let logging = if a.logger.is_active() {
+                    app.config
+                        .logging
+                        .file
+                        .clone()
+                        .unwrap_or_else(|| "stderr".into())
+                } else {
+                    "off".into()
+                };
+                // Transport tweaks matter when debugging TLS/proxy trouble,
+                // so make the active ones (and only those) visible.
+                let net = &app.config.network;
+                let mut transport: Vec<String> = Vec::new();
+                if let Some(p) = net
+                    .proxy
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    transport.push(format!("proxy {p}"));
+                }
+                if let Some(ca) = net
+                    .ca_bundle
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    transport.push(format!("ca {ca}"));
+                }
+                if net.insecure == Some(true) {
+                    transport.push("insecure TLS".to_string());
+                }
+                let network = if transport.is_empty() {
+                    "default".to_string()
+                } else {
+                    transport.join(" · ")
                 };
                 let lines = format!(
-                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nreasoning: {}\nsession  : {} · {} messages\nusage    : {}\ntotal    : {}\ncwd      : {}\nconfig   : {}",
+                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nreasoning: {}\nsession  : {} · {} messages · {} checkpoint(s)\nusage    : {}\ntotal    : {}\nbudget   : {}\nretries  : {}\ncontext  : {} tok window (compact at {})\npost-edit: {}\nlogging  : {}\nnetwork  : {}\ncwd      : {}\nconfig   : {}",
                     app.active.name,
                     app.active.base_url,
                     a.model,
@@ -728,8 +877,16 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     app.active.reasoning_effort.as_deref().unwrap_or("model default"),
                     app.session.id,
                     a.messages.len(),
+                    app.session.checkpoints.len(),
                     usage,
                     total,
+                    budget,
+                    retries,
+                    a.ctx_window,
+                    budget::compact_threshold(a.ctx_window),
+                    hooks,
+                    logging,
+                    network,
                     app.cwd.display(),
                     Config::toml_path().display(),
                 );
@@ -745,7 +902,8 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 match out {
                     Ok(o) if o.contains("[exit: 0]") && o.lines().count() > 1 => {
                         let body = o.split_once('\n').map(|(_, r)| r).unwrap_or(&o);
-                        let _ = ev_tx.send(WorkerEvent::Info(format!("git diff:\n{}", body.trim_end())));
+                        let _ = ev_tx
+                            .send(WorkerEvent::Info(format!("git diff:\n{}", body.trim_end())));
                     }
                     Ok(_) => {
                         let _ = ev_tx.send(WorkerEvent::Info("no uncommitted changes".into()));
@@ -764,15 +922,16 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     &app.cwd,
                 ));
                 let diff = match &out {
-                    Ok(o) if o.contains("[exit: 0]") => {
-                        o.split_once('\n').map(|(_, r)| r).unwrap_or(o).trim_end_matches("[commit: ")
-                    }
+                    Ok(o) if o.contains("[exit: 0]") => o
+                        .split_once('\n')
+                        .map(|(_, r)| r)
+                        .unwrap_or(o)
+                        .trim_end_matches("[commit: "),
                     _ => "",
                 };
                 if diff.is_empty() {
-                    let _ = ev_tx.send(WorkerEvent::Info(
-                        "no uncommitted changes to review".into(),
-                    ));
+                    let _ =
+                        ev_tx.send(WorkerEvent::Info("no uncommitted changes to review".into()));
                     let _ = ev_tx.send(WorkerEvent::Busy(false));
                 } else {
                     let task = format!(
@@ -780,37 +939,32 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                          CRITICAL / WARNING / NIT lines with file:line references. \
                          If the changes look clean, say so explicitly.\n\n{diff}"
                     );
-                    let sink: Box<dyn crate::agent::UiSink> =
-                        Box::new(SubBridge {
-                            inner: WorkerBridge {
-                                tx: ev_tx.clone(),
-                                approve_rx: approve_rx.clone(),
-                                cancel: cancel.clone(),
-                            },
-                            prefix: "[review] ".to_string(),
-                        });
+                    let sink: Box<dyn crate::agent::UiSink> = Box::new(SubBridge {
+                        inner: WorkerBridge {
+                            tx: ev_tx.clone(),
+                            approve_rx: approve_rx.clone(),
+                            cancel: cancel.clone(),
+                        },
+                        prefix: "[review] ".to_string(),
+                    });
                     let client = app.agent.client.clone();
                     let model = app.agent.model.clone();
                     let cwd = app.agent.cwd.clone();
                     let mode = app.agent.mode;
                     let report = rt.block_on(crate::agents::run_sub_agent(
-                        &client,
-                        &model,
-                        &cwd,
-                        mode,
-                        "reviewer",
-                        &task,
-                        sink,
+                        &client, &model, &cwd, mode, "reviewer", &task, sink,
                     ));
-                    let _ = ev_tx.send(WorkerEvent::Info(format!(
-                        "review complete:\n{report}"
-                    )));
+                    let _ = ev_tx.send(WorkerEvent::Info(format!("review complete:\n{report}")));
                     let _ = ev_tx.send(WorkerEvent::Busy(false));
                 }
             }
             WorkerCmd::Undo(n) => match app.agent.undo_turns(n) {
-                Ok(msg) => { let _ = ev_tx.send(WorkerEvent::Info(msg)); }
-                Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
+                Ok(msg) => {
+                    let _ = ev_tx.send(WorkerEvent::Info(msg));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
             },
             WorkerCmd::ListSessions => {
                 let recent = Session::list_recent(12);
@@ -835,9 +989,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             WorkerCmd::ListSessionsByKeyword(kw) => {
                 let hits = Session::find_by_keyword(&kw, 20);
                 if hits.is_empty() {
-                    let _ = ev_tx.send(WorkerEvent::Info(
-                        format!("no sessions match '{kw}'"),
-                    ));
+                    let _ = ev_tx.send(WorkerEvent::Info(format!("no sessions match '{kw}'")));
                 } else {
                     let items = hits
                         .into_iter()
@@ -846,10 +998,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                                 .name
                                 .map(|n| format!("{} · {n}", s.id))
                                 .unwrap_or_else(|| s.id.clone());
-                            format!(
-                                "{label} · {} · {preview}",
-                                fmt_unix_date(s.created_unix)
-                            )
+                            format!("{label} · {} · {preview}", fmt_unix_date(s.created_unix))
                         })
                         .collect();
                     let _ = ev_tx.send(WorkerEvent::Pick {
@@ -865,9 +1014,8 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         let _ = ev_tx.send(WorkerEvent::SessionDeleted(removed));
                     }
                     Ok(None) => {
-                        let _ = ev_tx.send(WorkerEvent::Error(
-                            format!("no session '{real}' to delete"),
-                        ));
+                        let _ = ev_tx
+                            .send(WorkerEvent::Error(format!("no session '{real}' to delete")));
                     }
                     Err(e) => {
                         let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
@@ -879,13 +1027,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let _ = ev_tx.send(WorkerEvent::SessionName(
                         app.session.name.clone().unwrap_or_default(),
                     ));
-                    let _ = ev_tx.send(WorkerEvent::Info(
-                        if let Some(n) = &app.session.name {
-                            format!("session named '{n}'")
-                        } else {
-                            "session name cleared".into()
-                        },
-                    ));
+                    let _ = ev_tx.send(WorkerEvent::Info(if let Some(n) = &app.session.name {
+                        format!("session named '{n}'")
+                    } else {
+                        "session name cleared".into()
+                    }));
                 }
                 Err(e) => {
                     let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
@@ -903,7 +1049,57 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                             session_name: app.session.name.clone(),
                         });
                     }
-                    Err(e) => { let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}"))); }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::Checkpoint(label) => {
+                // Snapshot the live agent conversation (not the persisted
+                // copy) so the checkpoint reflects what the user just saw.
+                app.session.messages = app.agent.messages.clone();
+                match app.session.create_checkpoint(label) {
+                    Ok(cp) => {
+                        let _ = ev_tx.send(WorkerEvent::Info(format!(
+                            "checkpoint #{} saved ({}) · branch later with /branch {}\nbranch id: {}",
+                            app.session.checkpoints.len(),
+                            cp.id,
+                            app.session.checkpoints.len(),
+                            cp.id
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::ListCheckpoints => {
+                app.session.messages = app.agent.messages.clone();
+                let list = app.session.checkpoint_list();
+                let _ = ev_tx.send(WorkerEvent::Info(list));
+            }
+            WorkerCmd::BranchCheckpoint(cp_ref) => {
+                app.session.messages = app.agent.messages.clone();
+                match app.session.branch_from(&cp_ref) {
+                    Ok(branched) => {
+                        // Switch the live conversation to the branch.
+                        match resume_session(&mut app, &branched.id) {
+                            Ok((msg, entries)) => {
+                                let _ = ev_tx.send(WorkerEvent::Reload {
+                                    text: msg,
+                                    entries,
+                                    session_id: app.session.id.clone(),
+                                    session_name: app.session.name.clone(),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
                 }
             }
             WorkerCmd::QueueImage(path) => match load_image_data_uri(&app.cwd, &path) {
@@ -921,7 +1117,8 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             WorkerCmd::SetupListModels { base_url, api_key } => {
                 // Authenticated catalog peek — this doubles as proof that
                 // the freshly typed key actually works before we save it.
-                let probe = ChatClient::new(&base_url, &api_key, &Default::default(), None, "openai");
+                let probe =
+                    ChatClient::new(&base_url, &api_key, &Default::default(), None, "openai");
                 match probe.and_then(|c| rt.block_on(c.list_models())) {
                     Ok(models) => {
                         let _ = ev_tx.send(WorkerEvent::Pick {
@@ -934,22 +1131,23 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     }
                 }
             }
-            WorkerCmd::FinishProviderSetup { name, base_url, model, api_key } => {
-                match finish_provider_setup(
-                    &mut app, &rt, &name, &base_url, &model, &api_key,
-                ) {
-                    Ok(note) => {
-                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
-                            provider: app.active.name.clone(),
-                            model: app.agent.model.clone(),
-                        });
-                        let _ = ev_tx.send(WorkerEvent::Info(note));
-                    }
-                    Err(e) => {
-                        let _ = ev_tx.send(WorkerEvent::Error(format!("provider setup failed: {e:#}")));
-                    }
+            WorkerCmd::FinishProviderSetup {
+                name,
+                base_url,
+                model,
+                api_key,
+            } => match finish_provider_setup(&mut app, &rt, &name, &base_url, &model, &api_key) {
+                Ok(note) => {
+                    let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                        provider: app.active.name.clone(),
+                        model: app.agent.model.clone(),
+                    });
+                    let _ = ev_tx.send(WorkerEvent::Info(note));
                 }
-            }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("provider setup failed: {e:#}")));
+                }
+            },
             WorkerCmd::SetTheme(name) => {
                 app.config.theme = Some(name.clone());
                 let res = app.config.save();
@@ -984,7 +1182,10 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         .iter()
                         .map(|(n, p)| format!("{n} · {}", p.model))
                         .collect();
-                    let _ = ev_tx.send(WorkerEvent::Pick { title: title.into(), items });
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: title.into(),
+                        items,
+                    });
                 }
             }
             WorkerCmd::EditProviderPickModel(name) => {
@@ -1112,14 +1313,15 @@ pub fn load_image_data_uri(_cwd: &PathBuf, path: &str) -> Result<String> {
         .iter()
         .find(|(e, _)| *e == ext)
         .map(|(_, m)| *m)
-        .with_context(|| format!(
-            "unsupported image type '.{ext}' — use png/jpg/jpeg/webp/gif"
-        ))?;
+        .with_context(|| format!("unsupported image type '.{ext}' — use png/jpg/jpeg/webp/gif"))?;
     let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
     if bytes.len() > 8 * 1024 * 1024 {
         bail!("image too large ({} bytes, limit 8 MiB)", bytes.len());
     }
-    Ok(format!("data:{mime};base64,{}", crate::api::base64_encode(&bytes)))
+    Ok(format!(
+        "data:{mime};base64,{}",
+        crate::api::base64_encode(&bytes)
+    ))
 }
 
 /// Replace the live conversation with a stored session. Returns a status
@@ -1145,7 +1347,13 @@ fn resume_session(app: &mut App, id: &str) -> Result<(String, Vec<Entry>)> {
     app.persist();
     // Replay what happened so the user sees their earlier work on screen.
     let entries = transcript_entries(&app.agent.messages);
-    Ok((format!("resumed session {id} — replayed {} items above", entries.len()), entries))
+    Ok((
+        format!(
+            "resumed session {id} — replayed {} items above",
+            entries.len()
+        ),
+        entries,
+    ))
 }
 
 /// `1760000000` → `2025-10-09` without pulling chrono.
@@ -1198,7 +1406,10 @@ fn export_transcript(app: &App) -> Result<PathBuf> {
         if body.is_empty() && !msg.tool_calls.is_empty() {
             out.push_str("## assistant (tool calls)\n");
             for tc in &msg.tool_calls {
-                out.push_str(&format!("- `{}` {}\n", tc.function.name, tc.function.arguments));
+                out.push_str(&format!(
+                    "- `{}` {}\n",
+                    tc.function.name, tc.function.arguments
+                ));
             }
             out.push('\n');
         } else {
@@ -1247,7 +1458,9 @@ pub fn load_custom_commands(cwd: &std::path::Path) -> Vec<CustomCmd> {
     }
     dirs.push(cwd.join(".laudacode").join("commands"));
     for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut files: Vec<_> = rd.filter_map(|e| e.ok()).collect();
         files.sort_by_key(|e| e.file_name());
         for f in files {
@@ -1255,11 +1468,17 @@ pub fn load_custom_commands(cwd: &std::path::Path) -> Vec<CustomCmd> {
             if !name.ends_with(".md") {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(f.path()) else { continue };
+            let Ok(raw) = std::fs::read_to_string(f.path()) else {
+                continue;
+            };
             let (description, template) = split_frontmatter(&raw);
             let cmd_name = name.trim_end_matches(".md").to_string();
             out.retain(|c: &CustomCmd| c.name != cmd_name); // later dir wins
-            out.push(CustomCmd { name: cmd_name, description, template });
+            out.push(CustomCmd {
+                name: cmd_name,
+                description,
+                template,
+            });
         }
     }
     out
@@ -1297,7 +1516,9 @@ pub fn render_command_template(tpl: &str, args: &str, cwd: &std::path::Path) -> 
 
     // Shell injection: !`cmd`
     while let Some(start) = out.find("!`") {
-        let Some(rel_end) = out[start + 2..].find('`') else { break };
+        let Some(rel_end) = out[start + 2..].find('`') else {
+            break;
+        };
         let cmd = &out[start + 2..start + 2 + rel_end];
         let output = std::process::Command::new("sh")
             .arg("-c")
@@ -1306,8 +1527,7 @@ pub fn render_command_template(tpl: &str, args: &str, cwd: &std::path::Path) -> 
             .output()
             .ok()
             .map(|o| {
-                let mut s =
-                    String::from_utf8_lossy(&o.stdout).into_owned();
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
                 s.push_str(&String::from_utf8_lossy(&o.stderr));
                 s.trim_end().to_string()
             })
@@ -1327,10 +1547,11 @@ pub fn expand_at_files(text: &str, cwd: &std::path::Path) -> String {
     let mut rendered = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('@') {
-        let boundary = at == 0 || !{
-            let prev = rest[..at].chars().last().unwrap_or(' ');
-            prev.is_alphanumeric()
-        };
+        let boundary = at == 0
+            || !{
+                let prev = rest[..at].chars().last().unwrap_or(' ');
+                prev.is_alphanumeric()
+            };
         let token: String = rest[at + 1..]
             .chars()
             .take_while(|c| !c.is_whitespace())
@@ -1416,7 +1637,11 @@ impl App {
             &self.active.model,
             &self.active.name,
             &home_shortened(&self.cwd),
-            self.agent.messages.iter().filter(|m| m.role != "system").count(),
+            self.agent
+                .messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .count(),
         );
         // Seed the @-mention list from the project tree.
         {
@@ -1532,8 +1757,14 @@ impl App {
                 KeyAction::CycleMode => cycle_mode(tui, &ui_cmd),
                 KeyAction::ToggleBanner => {
                     tui.toggle_banner();
-                    let state = if tui.banner_visible() { "shown" } else { "hidden" };
-                    tui.set_status(format!("banner {state} — Ctrl+B to toggle"));
+                    if tui.banner_visible() {
+                        tui.set_status(format!(
+                            "banner: {} logo — Ctrl+B to toggle",
+                            tui.banner_logo().name
+                        ));
+                    } else {
+                        tui.set_status("banner hidden — Ctrl+B to toggle");
+                    }
                 }
                 KeyAction::Approve(answer) => {
                     let _ = ui_approve.send(answer);
@@ -1569,7 +1800,11 @@ impl App {
                             let _ = ui_cmd.send(WorkerCmd::SetModel(model.to_string()));
                         }
                     } else if let Some(resume_id) = sel.strip_prefix("resume:") {
-                        let real = resume_id.split(" · ").next().unwrap_or(resume_id).to_string();
+                        let real = resume_id
+                            .split(" · ")
+                            .next()
+                            .unwrap_or(resume_id)
+                            .to_string();
                         tui.set_status("restoring session");
                         let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
                     } else if let Some(skill) = sel.strip_prefix("skills:") {
@@ -1687,7 +1922,9 @@ impl App {
                                     Some(p) if is_free_kind(p.kind) => {
                                         let model = p.model;
                                         if model.is_empty() {
-                                            tui.push(Entry::Error("free provider preset missing a model".into()));
+                                            tui.push(Entry::Error(
+                                                "free provider preset missing a model".into(),
+                                            ));
                                             true
                                         } else {
                                             tui.set_status(format!("saving {key}…"));
@@ -1897,8 +2134,7 @@ impl App {
                                     tui.set_status("empty keyword — cancelled");
                                 } else {
                                     tui.set_status(format!("searching sessions: '{kw}'"));
-                                    let _ =
-                                        ui_cmd.send(WorkerCmd::ListSessionsByKeyword(kw));
+                                    let _ = ui_cmd.send(WorkerCmd::ListSessionsByKeyword(kw));
                                 }
                             }
                         }
@@ -1988,7 +2224,11 @@ impl App {
         let mut exit_id = initial_id;
         let mut exit_messages = 0usize;
         while std::time::Instant::now() < deadline {
-            match wait_events.lock().unwrap().recv_timeout(std::time::Duration::from_millis(100)) {
+            match wait_events
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
                 Ok(WorkerEvent::SessionSummary { id, messages }) => {
                     exit_id = id;
                     exit_messages = messages;
@@ -1999,7 +2239,10 @@ impl App {
                 Err(_) => break, // worker gone without a summary
             }
         }
-        Ok(SessionExit { id: exit_id, messages: exit_messages })
+        Ok(SessionExit {
+            id: exit_id,
+            messages: exit_messages,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2012,8 +2255,7 @@ impl App {
         cli_model: Option<&str>,
         mode_override: Option<ApprovalMode>,
     ) -> Result<Self> {
-        let active =
-            config.resolve_active(cli_provider, cli_base_url, cli_api_key, cli_model)?;
+        let active = config.resolve_active(cli_provider, cli_base_url, cli_api_key, cli_model)?;
         if let Some(t) = &config.theme {
             crate::theme::set(t);
         }
@@ -2027,23 +2269,47 @@ impl App {
                     .and_then(ApprovalMode::parse)
             })
             .unwrap_or(ApprovalMode::AutoEdit);
-        let client = ChatClient::new(
+        let mut client = ChatClient::new(
             &active.base_url,
             &active.api_key,
             &active.headers,
             active.reasoning_effort.clone(),
             &active.kind,
         )?;
+        // Transient failures are worth waiting out: a flaky connection
+        // shouldn't fail a coding task.
+        if let Some(n) = config.limits.max_retries {
+            client.set_max_retries(n as usize);
+        }
         let permissions = config.permission.clone();
         // Install user-defined specialists from [agents.*] before any
         // delegate schema is built.
         crate::agents::install_custom(&config.agents);
-        let agent = Agent::new(client, active.model.clone(), cwd.clone(), mode, permissions);
+        let ctx_window = config.context_window.unwrap_or(128_000);
+        let agent = Agent::with_config(
+            client,
+            active.model.clone(),
+            cwd.clone(),
+            mode,
+            permissions,
+            &config,
+            ctx_window,
+        );
 
         let session = Session::new();
         let ui = TermUi::new()?;
-        let ctx_window = config.context_window.unwrap_or(128_000);
-        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![], pending_custom_cmds: vec![] })
+        Ok(Self {
+            config,
+            active,
+            agent,
+            session,
+            ui,
+            cwd,
+            ctx_window,
+            pending_images: vec![],
+            pending_transcript: vec![],
+            pending_custom_cmds: vec![],
+        })
     }
 
     /// Bare App with a placeholder provider — used when config resolution
@@ -2071,7 +2337,18 @@ impl App {
         let session = Session::new();
         let ui = TermUi::new()?;
         let ctx_window = 128_000;
-        Ok(Self { config, active, agent, session, ui, cwd, ctx_window, pending_images: vec![], pending_transcript: vec![], pending_custom_cmds: vec![] })
+        Ok(Self {
+            config,
+            active,
+            agent,
+            session,
+            ui,
+            cwd,
+            ctx_window,
+            pending_images: vec![],
+            pending_transcript: vec![],
+            pending_custom_cmds: vec![],
+        })
     }
 
     pub fn restore_session(&mut self, sess: Session) {
@@ -2097,16 +2374,14 @@ impl App {
         // Auto-title the session from its first assistant reply (if the user
         // hasn't named it via /session rename).
         if self.session.name.is_none() {
-            let title = self.agent.messages.iter()
+            let title = self
+                .agent
+                .messages
+                .iter()
                 .filter(|m| m.role == "assistant")
                 .filter_map(|m| m.content.clone())
                 .find(|c| !c.trim().is_empty())
-                .map(|c| {
-                    c.split_whitespace()
-                        .take(8)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                });
+                .map(|c| c.split_whitespace().take(8).collect::<Vec<_>>().join(" "));
             if let Some(t) = title {
                 let cleaned: String = t.chars().take(48).collect();
                 if !cleaned.is_empty() {
@@ -2116,7 +2391,10 @@ impl App {
         }
         self.session.messages = self.agent.messages.clone();
         if let Err(e) = self.session.save() {
-            eprintln!("{}", format!("warn: could not save session: {e}").dark_grey());
+            eprintln!(
+                "{}",
+                format!("warn: could not save session: {e}").dark_grey()
+            );
         }
     }
 
@@ -2166,7 +2444,12 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         WorkerEvent::Ev(AgentEvent::Todo(todos)) => {
             tui.dash.set_plan(&todos);
             let done = todos.iter().filter(|t| t.status == "completed").count();
-            tui.set_status(format!("plan {}/{}", done, todos.len()));
+            tui.set_status(format!("plan {done}/{}", todos.len()));
+        }
+        WorkerEvent::Ev(AgentEvent::Notice(msg)) => {
+            // Transient provider hiccup: show it in the status line without
+            // polluting the transcript, and keep the spinner alive.
+            tui.set_status(msg);
         }
         WorkerEvent::NeedApproval(desc) => {
             tui.open_approval(desc);
@@ -2181,7 +2464,12 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         }
         WorkerEvent::Info(s) => tui.push(Entry::Info(s)),
         WorkerEvent::Error(s) => tui.push(Entry::Error(s)),
-        WorkerEvent::Reload { text, entries, session_id, session_name } => {
+        WorkerEvent::Reload {
+            text,
+            entries,
+            session_id,
+            session_name,
+        } => {
             let count = entries.len();
             tui.entries.clear();
             for e in entries {
@@ -2189,7 +2477,8 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
             }
             tui.push(Entry::Info(text));
             tui.dash.session_id = crate::tui::shorten_session_id(&session_id);
-            tui.dash.set_name(session_name.as_deref().unwrap_or_default());
+            tui.dash
+                .set_name(session_name.as_deref().unwrap_or_default());
             tui.dash.messages = count;
         }
         // Consumed by tui_main after the loop ends; never reaches the UI.
@@ -2233,10 +2522,7 @@ pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     // tool_call id -> tool name, so results can be paired with their calls.
     let mut open_calls: HashMap<String, String> = HashMap::new();
-    const MARKERS: &[&str] = &[
-        "[Resuming previous session",
-        "[Conversation was compacted",
-    ];
+    const MARKERS: &[&str] = &["[Resuming previous session", "[Conversation was compacted"];
     for m in messages {
         match m.role.as_str() {
             "user" => {
@@ -2249,14 +2535,9 @@ pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
             "assistant" => {
                 for tc in &m.tool_calls {
                     open_calls.insert(tc.id.clone(), tc.tool_name().to_string());
-                    let summary = tools::parse_tool_action(
-                        tc.tool_name(),
-                        &tc.function.arguments,
-                    )
-                    .map(|a| a.describe())
-                    .unwrap_or_else(|_| {
-                        tc.function.arguments.chars().take(80).collect()
-                    });
+                    let summary = tools::parse_tool_action(tc.tool_name(), &tc.function.arguments)
+                        .map(|a| a.describe())
+                        .unwrap_or_else(|_| tc.function.arguments.chars().take(80).collect());
                     out.push(Entry::ToolCall {
                         name: tc.function.name.clone(),
                         summary,
@@ -2275,8 +2556,7 @@ pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
                     .and_then(|id| open_calls.get(id).cloned())
                     .unwrap_or_else(|| "tool".into());
                 let body = m.content.clone().unwrap_or_default();
-                let failed =
-                    body.starts_with("Error") || body.starts_with("Command failed");
+                let failed = body.starts_with("Error") || body.starts_with("Command failed");
                 out.push(Entry::ToolResult {
                     name,
                     ok: !failed,
@@ -2292,7 +2572,6 @@ pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
     }
     out
 }
-
 
 fn tui_mode_of(mode: ApprovalMode) -> tuiapp::Mode {
     match mode {
@@ -2334,7 +2613,9 @@ fn cycle_mode(tui: &mut Tui, cmd: &Sender<WorkerCmd>) {
     };
     tui.set_status(label);
     tui.push(Entry::Info(format!("switched to {}", tui.mode.label())));
-    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(tui.mode)));
+    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(
+        tui.mode,
+    )));
 }
 
 /// Apply a mode chosen from the /approvals picker.
@@ -2346,8 +2627,13 @@ fn apply_mode_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str) {
         _ => return,
     };
     tui.mode = mode;
-    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(mode)));
-    tui.push(Entry::Info(format!("approval mode set to {}", mode.label())));
+    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(
+        mode,
+    )));
+    tui.push(Entry::Info(format!(
+        "approval mode set to {}",
+        mode.label()
+    )));
 }
 
 /// Translate a `/reasoning` picker label to the `reasoning_effort` value it
@@ -2367,8 +2653,14 @@ fn reasoning_label_to_effort(label: &str) -> Option<String> {
 /// Every label the `/reasoning` picker may ever offer (the visible list is
 /// model-aware — see [`reasoning_choices`]); also the accepted set for
 /// validation of any label that does come back.
-const REASONING_CHOICES: &[&str] =
-    &["normal (model default)", "default (model default)", "low", "medium", "high", "max"];
+const REASONING_CHOICES: &[&str] = &[
+    "normal (model default)",
+    "default (model default)",
+    "low",
+    "medium",
+    "high",
+    "max",
+];
 
 /// Whether the active model accepts `reasoning_effort: "max"` (the xAI
 /// spelling, used by Grok reasoning models). Everything else speaks the
@@ -2397,7 +2689,9 @@ fn reasoning_choices(model: &str, provider: &str) -> Vec<String> {
 /// True when the label is one of the picker's own entries (used to tell a
 /// valid "clear the hint" choice apart from an unknown label).
 fn is_reasoning_choice(label: &str) -> bool {
-    REASONING_CHOICES.iter().any(|c| c.eq_ignore_ascii_case(label))
+    REASONING_CHOICES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(label))
 }
 
 /// Translate a `/reasoning` picker label into a `SetReasoning` worker
@@ -2410,13 +2704,21 @@ fn apply_reasoning_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str)
     }
     let effort = reasoning_label_to_effort(label);
     let _ = cmd.send(WorkerCmd::SetReasoning(effort.clone()));
-    tui.set_status(effort.map(|e| format!("reasoning: {e}")).unwrap_or_else(|| "reasoning: model default".into()));
+    tui.set_status(
+        effort
+            .map(|e| format!("reasoning: {e}"))
+            .unwrap_or_else(|| "reasoning: model default".into()),
+    );
 }
 
 /// Slash-command dispatch inside the TUI — forwards to the worker./// Returns false when the loop should quit.
 fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
     let mut parts = line.split_whitespace();
-    let name = parts.next().unwrap_or("").trim_start_matches('/').to_lowercase();
+    let name = parts
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_lowercase();
     let arg: Vec<&str> = parts.collect();
     match name.as_str() {
         "help" => {
@@ -2466,7 +2768,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             if arg.is_empty() {
                 let _ = cmd.send(WorkerCmd::ListSkills);
             } else {
-                tui.push(Entry::Error("usage: /skills — opens a searchable skill picker".into()));
+                tui.push(Entry::Error(
+                    "usage: /skills — opens a searchable skill picker".into(),
+                ));
             }
         }
         "compact" => {
@@ -2538,7 +2842,10 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             // Model-aware picker, same shape as /approvals; the choice comes
             // back as OpenSlash("reasoning:<label>"). "max" is the xAI
             // spelling and is only offered when the active model speaks it.
-            tui.open_picker("reasoning", reasoning_choices(&tui.dash.model, &tui.dash.provider));
+            tui.open_picker(
+                "reasoning",
+                reasoning_choices(&tui.dash.model, &tui.dash.provider),
+            );
         }
         "retry" => {
             tui.set_status("retrying");
@@ -2548,6 +2855,30 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.set_status("loading sessions");
             let _ = cmd.send(WorkerCmd::ListSessions);
         }
+        "checkpoint" => {
+            // Optional label; the worker snapshots the live conversation.
+            let label = arg.join(" ");
+            let _ = cmd.send(WorkerCmd::Checkpoint(if label.is_empty() {
+                None
+            } else {
+                Some(label)
+            }));
+        }
+        "checkpoints" => {
+            let _ = cmd.send(WorkerCmd::ListCheckpoints);
+        }
+        "branch" => match arg.first().copied() {
+            Some(cp) => {
+                tui.set_status("branching");
+                let _ = cmd.send(WorkerCmd::BranchCheckpoint(cp.to_string()));
+            }
+            None => {
+                let _ = cmd.send(WorkerCmd::ListCheckpoints);
+                tui.push(Entry::Info(
+                    "pick a checkpoint to branch from — e.g. /branch 1".into(),
+                ));
+            }
+        },
         "session" => {
             // `/session` groups every session-management action under one roof.
             match arg.first().copied() {
@@ -2651,7 +2982,10 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             let _ = cmd.send(WorkerCmd::Review);
         }
         "theme" => {
-            let items = crate::theme::names().into_iter().map(String::from).collect();
+            let items = crate::theme::names()
+                .into_iter()
+                .map(String::from)
+                .collect();
             tui.open_picker("theme", items);
         }
         "effect" => {
@@ -2676,7 +3010,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             let _ = cmd.send(WorkerCmd::Undo(n));
         }
         other => {
-            tui.push(Entry::Error(format!("unknown command '/{other}' — try /help")));
+            tui.push(Entry::Error(format!(
+                "unknown command '/{other}' — try /help"
+            )));
         }
     }
     true
@@ -2685,7 +3021,12 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
 /// A `/skills` picker choice: stage the skill in the composer (like an
 /// @-mention) — the user finishes the prompt; nothing is auto-submitted.
 fn apply_skill_selection(tui: &mut Tui, skill: &str) {
-    let name = skill.split(" — ").next().unwrap_or(skill).trim().to_string();
+    let name = skill
+        .split(" — ")
+        .next()
+        .unwrap_or(skill)
+        .trim()
+        .to_string();
     let phrase = format!("Use the '{name}' skill — ");
     if tui.input.trim().is_empty() {
         tui.input = phrase;
@@ -2706,16 +3047,46 @@ fn placeholder_key(key: &str) -> bool {
         return true;
     }
     const PLACEHOLDERS: &[&str] = &[
-        "<key>", "your-key", "your_key", "yourkey", "changeme", "change-me",
-        "xxx", "placeholder", "sk-test", "sk-xxx", "sk-...", "none", "null",
+        "<key>",
+        "your-key",
+        "your_key",
+        "yourkey",
+        "changeme",
+        "change-me",
+        "xxx",
+        "placeholder",
+        "sk-test",
+        "sk-xxx",
+        "sk-...",
+        "none",
+        "null",
     ];
-    PLACEHOLDERS.iter().any(|p| k == *p || (k.starts_with("sk-") && p.starts_with("sk-") && k.contains(&p[3..])))
+    PLACEHOLDERS
+        .iter()
+        .any(|p| k == *p || (k.starts_with("sk-") && p.starts_with("sk-") && k.contains(&p[3..])))
 }
 
 /// Print the brand banner to a plain terminal (exec mode, wizard).
+/// The one-line identity shown when no logo fits `width`: the name, plus the
+/// version when both fit with a gap between them. The name is the last thing
+/// to go, so a pathologically narrow terminal still shows something
+/// recognizable.
+fn compact_identity(width: u16) -> (String, String) {
+    let (name, version) = ("LaudaCode", format!("v{}", env!("CARGO_PKG_VERSION")));
+    let w = width as usize;
+    if w == 0 {
+        return (String::new(), String::new());
+    }
+    if w >= name.len() + 2 + version.len() {
+        (name.to_string(), version)
+    } else {
+        (name.chars().take(w).collect(), String::new())
+    }
+}
+
 pub fn print_banner() {
     use crossterm::style::Color as CT;
-    // Theme-driven gradient; branding text is embedded in the art itself.
+    // Theme-driven gradient; branding sits in the right-hand identity block.
     fn to_ct(c: ratatui::style::Color) -> CT {
         use ratatui::style::Color as RC;
         match c {
@@ -2737,10 +3108,41 @@ pub fn print_banner() {
             _ => CT::Green,
         }
     }
-    let grad = crate::theme::banner_gradient(crate::tui::BANNER.lines().count());
-    for (i, line) in crate::tui::BANNER.lines().enumerate() {
-        let color = grad.get(i).copied().map(to_ct).unwrap_or(CT::Green);
-        println!("{}", line.with(color).bold());
+    // Respect the real terminal width so a wide logo can never wrap. A
+    // zero/unknown size (some ptys and Android terms report 0) is treated as
+    // "unlimited" rather than "no room" — losing the banner is worse than
+    // letting it wrap.
+    let width = match crossterm::terminal::size() {
+        Ok((w, _)) if w > 0 => w,
+        _ => u16::MAX,
+    };
+    // Too narrow for even the most compact logo: fall back to the same
+    // one-line identity the TUI shows on small screens, so the splash can
+    // never wrap.
+    if !crate::tui::any_logo_fits(width) {
+        let t = crate::theme::get();
+        let (name, version) = compact_identity(width);
+        let mut line = name.with(to_ct(t.accent)).bold().to_string();
+        if !version.is_empty() {
+            line.push_str(&format!("  {}", version.with(to_ct(t.dim))));
+        }
+        println!("{line}\n");
+        return;
+    }
+    let art = crate::tui::pick_logo(width);
+    // Reuse the TUI's own composition so the splash and the banner band are
+    // pixel-identical: same logo, same identity block, same centering.
+    for line in crate::tui::banner_lines(art) {
+        let mut out = String::new();
+        for span in line.spans {
+            let text: &str = span.content.as_ref();
+            match span.style.fg {
+                // The TUI pads with unstyled spaces; keep those plain.
+                None => out.push_str(text),
+                Some(c) => out.push_str(&text.with(to_ct(c)).bold().to_string()),
+            }
+        }
+        println!("{out}");
     }
     println!();
 }
@@ -2808,7 +3210,9 @@ fn append_prompt_history(line: &str) {
 /// Keep the on-disk history within [`HISTORY_MAX`] lines.
 fn trim_history_file(path: &PathBuf) {
     const MAX_LINES: usize = 500;
-    let Ok(raw) = std::fs::read_to_string(path) else { return };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
     let lines: Vec<&str> = raw.lines().collect();
     if lines.len() <= MAX_LINES {
         return;
@@ -2834,30 +3238,135 @@ pub struct ProviderPreset {
 }
 
 pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
-    ProviderPreset { name: "openrouter", base_url: "https://openrouter.ai/api/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "tokenrouter", base_url: "https://api.tokenrouter.com/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "openai", base_url: "https://api.openai.com/v1", kind: "openai", model: "" },
+    ProviderPreset {
+        name: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "tokenrouter",
+        base_url: "https://api.tokenrouter.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "openai",
+        base_url: "https://api.openai.com/v1",
+        kind: "openai",
+        model: "",
+    },
     // Google's OpenAI-compatible endpoint. Gemini 3+ models gate tool calls
     // on thought signatures — the client detects this endpoint and handles
     // the signature roundtrip automatically.
-    ProviderPreset { name: "gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", kind: "openai", model: "" },
-    ProviderPreset { name: "anthropic", base_url: "https://api.anthropic.com/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "groq", base_url: "https://api.groq.com/openai/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "deepseek", base_url: "https://api.deepseek.com/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "together", base_url: "https://api.together.xyz/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "xai", base_url: "https://api.x.ai/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "mistral", base_url: "https://api.mistral.ai/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "cerebras", base_url: "https://api.cerebras.ai/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "moonshot", base_url: "https://api.moonshot.ai/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "zai", base_url: "https://api.z.ai/api/paas/v4", kind: "openai", model: "" },
-    ProviderPreset { name: "novita", base_url: "https://api.novita.ai/v3/openai", kind: "openai", model: "" },
-    ProviderPreset { name: "chutes", base_url: "https://llm.chutes.ai/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "ollama", base_url: "http://localhost:11434/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "ollamacloud", base_url: "https://ollama.com/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "lmstudio", base_url: "http://localhost:1234/v1", kind: "openai", model: "" },
-    ProviderPreset { name: "aitopia", base_url: "https://extensions.aitopia.ai/ai/send", kind: "aitopia", model: "AITOPIA" },
-    ProviderPreset { name: "powerbrain", base_url: "https://powerbrainai.com/app/backend/api/api.php", kind: "powerbrain", model: "gpt-5" },
-    ProviderPreset { name: "custom", base_url: "", kind: "openai", model: "" },
+    ProviderPreset {
+        name: "gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "anthropic",
+        base_url: "https://api.anthropic.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "groq",
+        base_url: "https://api.groq.com/openai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "deepseek",
+        base_url: "https://api.deepseek.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "together",
+        base_url: "https://api.together.xyz/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "xai",
+        base_url: "https://api.x.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "mistral",
+        base_url: "https://api.mistral.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "cerebras",
+        base_url: "https://api.cerebras.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "moonshot",
+        base_url: "https://api.moonshot.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "zai",
+        base_url: "https://api.z.ai/api/paas/v4",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "novita",
+        base_url: "https://api.novita.ai/v3/openai",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "chutes",
+        base_url: "https://llm.chutes.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "ollama",
+        base_url: "http://localhost:11434/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "ollamacloud",
+        base_url: "https://ollama.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "lmstudio",
+        base_url: "http://localhost:1234/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "aitopia",
+        base_url: "https://extensions.aitopia.ai/ai/send",
+        kind: "aitopia",
+        model: "AITOPIA",
+    },
+    ProviderPreset {
+        name: "powerbrain",
+        base_url: "https://powerbrainai.com/app/backend/api/api.php",
+        kind: "powerbrain",
+        model: "gpt-5",
+    },
+    ProviderPreset {
+        name: "custom",
+        base_url: "",
+        kind: "openai",
+        model: "",
+    },
 ];
 
 /// Look up a built-in preset by name, if any.
@@ -2970,7 +3479,10 @@ fn finish_provider_setup(
     let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
     // Presets carry the transport kind + default model; anything not in the
     // table (or typed in by hand) is treated as OpenAI-compatible (keyed).
-    let kind = find_preset(name).map(|p| p.kind).unwrap_or("openai").to_string();
+    let kind = find_preset(name)
+        .map(|p| p.kind)
+        .unwrap_or("openai")
+        .to_string();
     let free = is_free_kind(&kind);
     anyhow::ensure!(
         !api_key.trim().is_empty() || is_local || free,
@@ -3033,7 +3545,10 @@ fn edit_provider_model(app: &mut App, provider: &str, model: &str) -> Result<Str
     } else {
         app.config.save()?;
     }
-    Ok(format!("model for '{provider}' set to {model}{}", if is_active { " (live)" } else { "" }))
+    Ok(format!(
+        "model for '{provider}' set to {model}{}",
+        if is_active { " (live)" } else { "" }
+    ))
 }
 
 /// `/provider edit` → replace the stored API key of a configured provider.
@@ -3081,7 +3596,9 @@ fn finish_edit_api_key(
                 bail!("key rejected ({e:#}) — old key restored");
             }
         }
-        Ok(format!("API key updated for '{provider}' — verified with a live test request"))
+        Ok(format!(
+            "API key updated for '{provider}' — verified with a live test request"
+        ))
     } else {
         // Inactive provider: verify before saving so a typo can't poison
         // the config for later.
@@ -3091,12 +3608,13 @@ fn finish_edit_api_key(
         };
         if !is_local {
             let probe = ChatClient::new(&base_url, api_key.trim(), &headers, None, "openai")?;
-            rt.block_on(probe.probe_chat(&model)).with_context(|| {
-                "key rejected — old key kept unchanged"
-            })?;
+            rt.block_on(probe.probe_chat(&model))
+                .with_context(|| "key rejected — old key kept unchanged")?;
         }
         app.config.save()?;
-        Ok(format!("API key updated for '{provider}' (not active — /provider use to switch)"))
+        Ok(format!(
+            "API key updated for '{provider}' (not active — /provider use to switch)"
+        ))
     }
 }
 
@@ -3108,7 +3626,11 @@ pub fn list_providers(cfg: &Config) {
         return;
     }
     for (name, p) in &cfg.providers {
-        let star = if *name == active_name { format!("{}", "*".cyan().bold()) } else { " ".to_string() };
+        let star = if *name == active_name {
+            format!("{}", "*".cyan().bold())
+        } else {
+            " ".to_string()
+        };
         println!(
             "{star} {:<14} {} ({})",
             name.clone().bold(),
@@ -3119,10 +3641,7 @@ pub fn list_providers(cfg: &Config) {
 }
 
 /// Interactive (or flag-driven) provider creation. Returns the provider name.
-pub fn add_provider_flow(
-    cfg: &mut Config,
-    name_arg: Option<&str>,
-) -> Result<String> {
+pub fn add_provider_flow(cfg: &mut Config, name_arg: Option<&str>) -> Result<String> {
     println!("{}", "── add provider ──".bold());
 
     let name = match name_arg {
@@ -3140,15 +3659,15 @@ pub fn add_provider_flow(
     }
     let choice = prompt_line("preset number", "1")?;
     let idx: usize = choice.trim().parse().unwrap_or(1);
-    let (base_default, preset_name, preset_kind, preset_model) = match presets.get(idx.saturating_sub(1)) {
-        Some(p) => (p.base_url, p.name, p.kind, p.model),
-        None => ("", "", "openai", ""),
-    };
+    let (base_default, preset_name, preset_kind, preset_model) =
+        match presets.get(idx.saturating_sub(1)) {
+            Some(p) => (p.base_url, p.name, p.kind, p.model),
+            None => ("", "", "openai", ""),
+        };
 
     let base_url = prompt_line("base_url", base_default)?;
     let model = prompt_line("model", preset_model)?;
-    let is_local =
-        base_url.contains("localhost") || base_url.contains("127.0.0.1");
+    let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
     // Keyless presets (aitopia/powerbrain), Ollama/LM Studio and
     // any local server always allow a blank key; for anything else (including
     // a custom provider) the key is only optional when the base URL is local.
@@ -3165,8 +3684,19 @@ pub fn add_provider_flow(
     let headers = prompt_line("extra headers (Key: Value, …)", "")?;
     let header_map = parse_headers(&headers);
 
-    let kind = if is_free_kind(preset_kind) { preset_kind.to_string() } else { "openai".to_string() };
-    let p = Provider { base_url, api_key, kind, model, headers: header_map, reasoning_effort: None };
+    let kind = if is_free_kind(preset_kind) {
+        preset_kind.to_string()
+    } else {
+        "openai".to_string()
+    };
+    let p = Provider {
+        base_url,
+        api_key,
+        kind,
+        model,
+        headers: header_map,
+        reasoning_effort: None,
+    };
     // Prove the key/model before touching the config file.
     verify_provider_creds(&p)?;
     cfg.providers.insert(name.clone(), p);
@@ -3181,7 +3711,10 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
         .get(name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("provider '{name}' not found"))?;
-    println!("{}", format!("── editing '{name}' (enter = keep current) ──").bold());
+    println!(
+        "{}",
+        format!("── editing '{name}' (enter = keep current) ──").bold()
+    );
     let base_url = prompt_line("base_url", &p.base_url)?;
     let model = prompt_line("model", &p.model)?;
     let api_key_in = prompt_line("api_key (enter = keep stored key)", "")?;
@@ -3197,7 +3730,11 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
         base_url,
         model,
         kind: p.kind.clone(),
-        api_key: if api_key_in.is_empty() { p.api_key.clone() } else { api_key_in },
+        api_key: if api_key_in.is_empty() {
+            p.api_key.clone()
+        } else {
+            api_key_in
+        },
         headers: parse_headers(&headers),
         reasoning_effort: p.reasoning_effort.clone(),
     };
@@ -3205,7 +3742,10 @@ pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
     verify_provider_creds(&updated)?;
     cfg.providers.insert(name.to_string(), updated);
     cfg.save()?;
-    println!("· updated '{name}' (key stays in {})", Config::toml_path().display());
+    println!(
+        "· updated '{name}' (key stays in {})",
+        Config::toml_path().display()
+    );
     Ok(())
 }
 
@@ -3286,6 +3826,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_identity_always_fits_and_keeps_the_name() {
+        for w in 0u16..=80 {
+            let (name, version) = compact_identity(w);
+            if w == 0 {
+                assert!(name.is_empty() && version.is_empty());
+                continue;
+            }
+            // Name + two spaces + version must never exceed the terminal.
+            let len = name.chars().count()
+                + if version.is_empty() {
+                    0
+                } else {
+                    2 + version.chars().count()
+                };
+            assert!(
+                len <= w as usize,
+                "w={w} needs {len} cols: {name:?} {version:?}"
+            );
+            // The name is kept in full whenever there's room, clipped only when
+            // the terminal is narrower than the name itself.
+            let want: String = "LaudaCode".chars().take(w as usize).collect();
+            assert_eq!(name, want, "w={w} mangled the name");
+        }
+        // The version rides along as soon as both fit.
+        let (name, version) = compact_identity(80);
+        assert_eq!(name, "LaudaCode");
+        assert_eq!(version, format!("v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
     fn custom_command_pipeline_end_to_end() {
         let dir = std::env::temp_dir().join(format!("lc-cmds-{}", std::process::id()));
         let cmds = dir.join(".laudacode/commands");
@@ -3363,7 +3933,9 @@ mod tests {
             "tokenrouter stays available"
         );
         assert!(
-            PROVIDER_PRESETS.iter().any(|p| p.name == "custom" && p.base_url.is_empty()),
+            PROVIDER_PRESETS
+                .iter()
+                .any(|p| p.name == "custom" && p.base_url.is_empty()),
             "a custom (bring-your-own-base-url) preset must be offered in the TUI"
         );
         // New presets are all https (except the local servers + custom).
@@ -3371,11 +3943,22 @@ mod tests {
             let local_or_custom = p.name == "custom" || p.base_url.contains("localhost");
             assert!(
                 local_or_custom || p.base_url.starts_with("https://"),
-                "preset {} must use https: {}", p.name, p.base_url
+                "preset {} must use https: {}",
+                p.name,
+                p.base_url
             );
         }
         // The major additions the user asked for are present.
-        for k in ["anthropic", "xai", "mistral", "cerebras", "moonshot", "zai", "novita", "chutes"] {
+        for k in [
+            "anthropic",
+            "xai",
+            "mistral",
+            "cerebras",
+            "moonshot",
+            "zai",
+            "novita",
+            "chutes",
+        ] {
             assert!(
                 PROVIDER_PRESETS.iter().any(|p| p.name == k),
                 "preset {k} missing"
@@ -3434,7 +4017,9 @@ mod tests {
         // Even the free Gemini preset stays forthright — the endpoint
         // ignores reasoning_effort entirely but the picker still offers
         // the portable levels only.
-        assert!(reasoning_choices("gemini-3.5-flash", "gemini").iter().all(|c| c != "max"));
+        assert!(reasoning_choices("gemini-3.5-flash", "gemini")
+            .iter()
+            .all(|c| c != "max"));
         // Grok models (and the xai provider preset) unlock max.
         assert!(reasoning_choices("grok-3.5-reasoner", "xai").contains(&"max".to_string()));
         assert!(reasoning_choices("grok-4", "tokenrouter").contains(&"max".to_string()));
@@ -3451,7 +4036,10 @@ mod tests {
             headers: Default::default(),
             reasoning_effort: None,
         };
-        assert!(verify_provider_creds(&p).is_ok(), "local URLs skip the probe");
+        assert!(
+            verify_provider_creds(&p).is_ok(),
+            "local URLs skip the probe"
+        );
     }
 
     #[test]
@@ -3468,10 +4056,18 @@ mod tests {
         let app = App::build_with_config(
             dir.clone(),
             Config::default(),
-            args.0, args.1, args.2, args.3, None,
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            None,
         )
         .expect("app builds");
-        assert_eq!(app.agent.mode, ApprovalMode::AutoEdit, "BUILD is the default mode");
+        assert_eq!(
+            app.agent.mode,
+            ApprovalMode::AutoEdit,
+            "BUILD is the default mode"
+        );
         // Explicit config still wins over the default.
         let cfg = Config {
             approval_mode: Some("suggest".into()),
@@ -3487,9 +4083,10 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let _guard = crate::session::test_sync::env_lock();
-        let dir = std::env::current_dir().unwrap().join("target").join(format!(
-            "interrupt-test-{}", std::process::id()
-        ));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("interrupt-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let previous = std::env::var_os("LAUDACODE_SESSIONS_DIR");
         std::env::set_var("LAUDACODE_SESSIONS_DIR", dir.join("sessions"));
@@ -3500,40 +4097,68 @@ mod tests {
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
-                if let Ok((socket, _)) = listener.accept() { break socket; }
-                if Instant::now() >= deadline { return; }
+                if let Ok((socket, _)) = listener.accept() {
+                    break socket;
+                }
+                if Instant::now() >= deadline {
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let mut buf = [0; 4096];
             loop {
                 let n = socket.read(&mut buf).unwrap();
-                if n == 0 { return; }
+                if n == 0 {
+                    return;
+                }
                 request.extend_from_slice(&buf[..n]);
                 if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request[..end]);
-                    let length = headers.lines().find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok()).flatten()
-                    }).unwrap_or(0);
-                    if request.len() >= end + 4 + length { break; }
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
                 }
             }
-            socket.write_all(concat!(
+            socket
+                .write_all(
+                    concat!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"stream started\"}}]}\n\n"
-            ).as_bytes()).unwrap();
+            )
+                    .as_bytes(),
+                )
+                .unwrap();
             // Hold the stream open without sending another byte.
             let _ = stop_rx.recv_timeout(Duration::from_secs(10));
         });
         let app = App::build_with_config(
-            dir.clone(), Config::default(), Some("test"), Some(&url),
-            Some("test-key"), Some("test-model"), None,
-        ).unwrap();
+            dir.clone(),
+            Config::default(),
+            Some("test"),
+            Some(&url),
+            Some("test-key"),
+            Some("test-model"),
+            None,
+        )
+        .unwrap();
         let worker = spawn_worker(app);
-        worker.cmd.send(WorkerCmd::Submit("test cancellation".into())).unwrap();
+        worker
+            .cmd
+            .send(WorkerCmd::Submit("test cancellation".into()))
+            .unwrap();
         let mut streaming = false;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -3551,7 +4176,10 @@ mod tests {
         while Instant::now() < deadline {
             match worker.events.recv_timeout(Duration::from_millis(100)) {
                 Ok(WorkerEvent::Info(s)) if s == "interrupted" => interrupted = true,
-                Ok(WorkerEvent::Busy(false)) => { idle = true; break; }
+                Ok(WorkerEvent::Busy(false)) => {
+                    idle = true;
+                    break;
+                }
                 _ => {}
             }
         }
@@ -3566,7 +4194,10 @@ mod tests {
         }
         std::fs::remove_dir_all(dir).unwrap();
         assert!(streaming, "mock stream must reach the worker");
-        assert!(interrupted && idle, "UI cancellation must stop a stalled worker stream promptly");
+        assert!(
+            interrupted && idle,
+            "UI cancellation must stop a stalled worker stream promptly"
+        );
     }
 
     #[test]
@@ -3590,15 +4221,22 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(handle_slash(&mut tui, &tx, "/skills unexpected"));
         assert!(rx.try_recv().is_err());
-        assert!(matches!(tui.entries.last(), Some(Entry::Error(s)) if s.contains("usage: /skills")));
+        assert!(
+            matches!(tui.entries.last(), Some(Entry::Error(s)) if s.contains("usage: /skills"))
+        );
         assert!(handle_slash(&mut tui, &tx, "/help"));
         assert!(matches!(tui.entries.last(), Some(Entry::Info(s)) if s.contains("/skills")));
     }
 
     #[test]
-    fn prompt_history_roundtrips_through_disk() {        // Same lock as session tests — both flip LAUDACODE_SESSIONS_DIR.
+    fn prompt_history_roundtrips_through_disk() {
+        // Same lock as session tests — both flip LAUDACODE_SESSIONS_DIR.
         let _g = crate::session::test_sync::env_lock();
-        let dir = std::env::temp_dir().join(format!("lc-hist-{}-{}", std::process::id(), std::time::Instant::now().elapsed().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "lc-hist-{}-{}",
+            std::process::id(),
+            std::time::Instant::now().elapsed().as_nanos()
+        ));
         std::env::set_var("LAUDACODE_SESSIONS_DIR", &dir);
         // Isolated dir starts empty.
         assert!(load_prompt_history().is_empty());
@@ -3653,7 +4291,9 @@ mod tests {
         );
         // System prompts and housekeeping markers never leak on screen.
         let with_markers = vec![
-            Message::user("[Resuming previous session above. Continue where it left off.]".to_string()),
+            Message::user(
+                "[Resuming previous session above. Continue where it left off.]".to_string(),
+            ),
             Message::user("real question"),
         ];
         let replay = transcript_entries(&with_markers);
@@ -3667,19 +4307,5 @@ mod tests {
         }
         // A real-looking OpenRouter key must not be flagged.
         assert!(!placeholder_key("sk-or-v1-abc123def4567890"));
-    }
-
-    #[test]
-    fn estimate_cost_scales_with_tokens() {
-        // Zero usage costs nothing.
-        assert_eq!(estimate_cost(0, 0), 0.0);
-        // 1M input-only at $0.15.
-        let c = estimate_cost(1_000_000, 0);
-        assert!((c - 0.15).abs() < 1e-9, "{c}");
-        // 1M output-only at $0.60.
-        let c = estimate_cost(0, 1_000_000);
-        assert!((c - 0.60).abs() < 1e-9, "{c}");
-        // Monotonic: more tokens → strictly higher cost.
-        assert!(estimate_cost(10_000, 10_000) > estimate_cost(1_000, 1_000));
     }
 }

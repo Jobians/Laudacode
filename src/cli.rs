@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
     name = "laudacode",
     version,
     about = "Fast AI coding agent for your terminal — pure Rust.",
-    after_help = "Examples:\n  laudacode\n  laudacode exec \"explain the build error\"\n  laudacode -P openrouter -m anthropic/claude-3.7-sonnet\n  laudacode provider add groq"
+    after_help = "Examples:\n  laudacode\n  laudacode exec \"explain the build error\"\n  laudacode --resume <SESSION_ID_OR_NAME>\n  laudacode resume <SESSION_ID_OR_NAME>\n  laudacode session checkpoints <SESSION_ID_OR_NAME>\n  laudacode session branch <SESSION_ID_OR_NAME> <CHECKPOINT>\n  laudacode -P openrouter -m anthropic/claude-3.7-sonnet\n  laudacode provider add groq"
 )]
 pub struct Cli {
     /// Provider name from your config
@@ -33,14 +33,14 @@ pub struct Cli {
     pub full_auto: bool,
 
     /// Continue the most recent session
-    #[arg(short = 'c', long, global = true)]
+    #[arg(short = 'c', long, visible_alias = "continue", global = true)]
     pub continue_last: bool,
 
     /// Resume a saved session by its unique id or assigned name
     #[arg(
         long,
         global = true,
-        value_name = "SESSION_ID",
+        value_name = "SESSION_ID_OR_NAME",
         conflicts_with = "continue_last"
     )]
     pub resume: Option<String>,
@@ -74,10 +74,35 @@ pub enum Command {
         prompt: Vec<String>,
     },
 
+    /// Resume a saved session by its unique id, prefix, or assigned name
+    Resume { id_or_name: String },
+
+    /// Inspect and branch saved sessions
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+
     /// Manage API providers
     Provider {
         #[command(subcommand)]
         cmd: ProviderCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SessionCmd {
+    /// List the checkpoints recorded in a session
+    Checkpoints {
+        /// Session id, prefix, or assigned name
+        session: String,
+    },
+    /// Create a new session from one of a session's checkpoints
+    Branch {
+        /// Session id, prefix, or assigned name
+        session: String,
+        /// Checkpoint id, unique prefix, or 1-based index
+        checkpoint: String,
     },
 }
 

@@ -2,9 +2,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-fn code_fg() -> Color { crate::theme::get().code_fg }
-fn code_bg() -> Color { crate::theme::get().code_bg }
-fn rule_c() -> Color { crate::theme::get().rule }
+fn code_fg() -> Color {
+    crate::theme::get().code_fg
+}
+fn code_bg() -> Color {
+    crate::theme::get().code_bg
+}
+fn rule_c() -> Color {
+    crate::theme::get().rule
+}
 
 /// Render assistant markdown into styled transcript lines.
 ///
@@ -37,7 +43,12 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
             let inner_w = w.saturating_sub(3);
             let base = Style::default().fg(code_fg()).bg(code_bg());
             let mut spans = vec![Span::styled("  ".to_string(), base)];
-            spans.extend(crate::syntax::highlight_line(line, code_lang, &mut syn_state, base));
+            spans.extend(crate::syntax::highlight_line(
+                line,
+                code_lang,
+                &mut syn_state,
+                base,
+            ));
             out.extend(hard_split_spans(spans, inner_w));
             continue;
         }
@@ -60,7 +71,9 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
             out.extend(wrap_styled(
                 &[Span::styled(
                     body.to_string(),
-                    Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD),
                 )],
                 w,
             ));
@@ -68,8 +81,14 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
         }
 
         // Bullets → light purple dot.
-        if let Some(body) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
-            let mut spans = vec![Span::styled("• ".to_string(), Style::default().fg(Color::LightMagenta))];
+        if let Some(body) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let mut spans = vec![Span::styled(
+                "• ".to_string(),
+                Style::default().fg(Color::LightMagenta),
+            )];
             spans.extend(parse_inline(body));
             out.extend(wrap_styled(&spans, w));
             continue;
@@ -92,7 +111,9 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
             out.extend(wrap_styled(
                 &[Span::styled(
                     format!("▌ {body}"),
-                    Style::default().fg(Color::LightBlue).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::ITALIC),
                 )],
                 w,
             ));
@@ -146,9 +167,14 @@ pub fn parse_inline(text: &str) -> Vec<Span<'static>> {
                 let (label, url, consumed) = link_end;
                 spans.push(Span::styled(
                     label,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
                 ));
-                spans.push(Span::styled(format!(" ({url})"), Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format!(" ({url})"),
+                    Style::default().fg(Color::DarkGray),
+                ));
                 i += consumed;
                 continue;
             }
@@ -210,10 +236,14 @@ pub fn wrap_styled(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> 
                 cur_w = 0;
                 let word = word.trim_start().to_string();
                 let ww = UnicodeWidthStr::width(word.as_str());
-                rows.last_mut().unwrap().push(Span::styled(word, span.style));
+                rows.last_mut()
+                    .unwrap()
+                    .push(Span::styled(word, span.style));
                 cur_w += ww;
             } else {
-                rows.last_mut().unwrap().push(Span::styled(word, span.style));
+                rows.last_mut()
+                    .unwrap()
+                    .push(Span::styled(word, span.style));
                 cur_w += ww;
             }
         }
@@ -265,9 +295,7 @@ fn hard_split_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static
             cur_w += cw;
         }
     }
-    rows.into_iter()
-        .map(Line::from)
-        .collect()
+    rows.into_iter().map(Line::from).collect()
 }
 
 #[cfg(test)]
@@ -277,7 +305,13 @@ mod tests {
     fn plain(lines: &[Line]) -> Vec<String> {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect::<Vec<_>>().join(""))
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
             .collect()
     }
 
@@ -287,7 +321,10 @@ mod tests {
         let lines = render_markdown(md, 40);
         let texts = plain(&lines);
         assert!(texts.iter().any(|t| t == "Title"));
-        let title = lines.iter().find(|l| plain(std::slice::from_ref(l)) == ["Title"]).unwrap();
+        let title = lines
+            .iter()
+            .find(|l| plain(std::slice::from_ref(l)) == ["Title"])
+            .unwrap();
         assert_eq!(title.spans[0].style.fg, Some(Color::LightBlue));
         assert!(title.spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
@@ -305,7 +342,10 @@ mod tests {
     #[test]
     fn inline_code_is_light_yellow() {
         let spans = parse_inline("run `cargo build` now");
-        let code = spans.iter().find(|s| s.content.contains("cargo build")).unwrap();
+        let code = spans
+            .iter()
+            .find(|s| s.content.contains("cargo build"))
+            .unwrap();
         assert_eq!(code.style.fg, Some(code_fg()));
     }
 
@@ -338,7 +378,11 @@ mod tests {
         let spans = parse_inline(&"word ".repeat(60));
         let rows = wrap_styled(&spans, 20);
         for row in &rows {
-            let total: usize = row.spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum();
+            let total: usize = row
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
             assert!(total <= 20, "row width {total}");
         }
         assert!(rows.len() >= 5);

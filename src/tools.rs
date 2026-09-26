@@ -7,31 +7,87 @@ use crate::api::{FunctionDef, ToolDef};
 
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
 const MAX_READ_BYTES: u64 = 200 * 1024;
+/// Read-only git subcommands the `git` tool may run. Nothing here can write
+/// to the repository, the index, the working tree or any remote.
+const GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "show", "blame"];
 
 /// Actions the model can request. Parsed from tool-call arguments.
 #[derive(Debug, Clone)]
 pub enum Action {
-    ListDir { path: String },
-    ReadFile { path: String, offset: Option<u64>, limit: Option<u64> },
-    ViewImage { path: String },
-    WriteFile { path: String, content: String },
-    EditFile { path: String, old: String, new: String },
+    ListDir {
+        path: String,
+    },
+    ReadFile {
+        path: String,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    },
+    ViewImage {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    EditFile {
+        path: String,
+        old: String,
+        new: String,
+    },
     /// V4A patch — multi-file add/update/delete in one call.
-    ApplyPatch { patch: String },
-    RunCommand { command: String },
+    ApplyPatch {
+        patch: String,
+    },
+    RunCommand {
+        command: String,
+    },
     /// Start a long-lived managed process (dev server, watcher, REPL...).
-    StartProcess { command: String },
+    StartProcess {
+        command: String,
+    },
     /// Poll a managed process: status + buffered output since spawn.
-    PollProcess { id: u64 },
+    PollProcess {
+        id: u64,
+    },
     /// Send stdin to a managed process (eof=true closes stdin).
-    WriteProcess { id: u64, input: String, eof: bool },
+    WriteProcess {
+        id: u64,
+        input: String,
+        eof: bool,
+    },
     /// Kill + remove a managed process.
-    StopProcess { id: u64 },
-    FetchUrl { url: String },
-    WebSearch { query: String, max_results: usize },
-    Grep { pattern: String, path: Option<String>, ignore_case: bool, context: Option<u32> },
-    Glob { pattern: String, path: Option<String> },
-    UpdatePlan { todos: Vec<TodoItem> },
+    StopProcess {
+        id: u64,
+    },
+    FetchUrl {
+        url: String,
+    },
+    WebSearch {
+        query: String,
+        max_results: usize,
+    },
+    Grep {
+        pattern: String,
+        path: Option<String>,
+        ignore_case: bool,
+        context: Option<u32>,
+        /// Treat `pattern` as a regular expression instead of literal text.
+        regex: bool,
+    },
+    Glob {
+        pattern: String,
+        path: Option<String>,
+    },
+    /// Read-only git inspection (status, log, diff, show, blame).
+    Git {
+        subcommand: String,
+        path: Option<String>,
+        rev: Option<String>,
+        limit: Option<u32>,
+    },
+    UpdatePlan {
+        todos: Vec<TodoItem>,
+    },
 }
 
 /// One task in the shared todo list (surfaced live in the TUI).
@@ -131,6 +187,19 @@ struct GrepArgs {
     ignore_case: bool,
     #[serde(default)]
     context: Option<u32>,
+    #[serde(default)]
+    regex: bool,
+}
+
+#[derive(Deserialize)]
+struct GitArgs {
+    subcommand: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    rev: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -168,11 +237,17 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
         match name {
             "list_dir" => {
                 let a: ListDirArgs = serde_json::from_value(v)?;
-                Ok(Action::ListDir { path: a.path.unwrap_or_else(|| ".".into()) })
+                Ok(Action::ListDir {
+                    path: a.path.unwrap_or_else(|| ".".into()),
+                })
             }
             "read_file" => {
                 let a: ReadArgs = serde_json::from_value(v)?;
-                Ok(Action::ReadFile { path: a.path, offset: a.offset, limit: a.limit })
+                Ok(Action::ReadFile {
+                    path: a.path,
+                    offset: a.offset,
+                    limit: a.limit,
+                })
             }
             "view_image" => {
                 let a: ReadArgs = serde_json::from_value(v)?;
@@ -180,11 +255,18 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
             }
             "write_file" => {
                 let a: WriteArgs = serde_json::from_value(v)?;
-                Ok(Action::WriteFile { path: a.path, content: a.content })
+                Ok(Action::WriteFile {
+                    path: a.path,
+                    content: a.content,
+                })
             }
             "edit_file" => {
                 let a: EditArgs = serde_json::from_value(v)?;
-                Ok(Action::EditFile { path: a.path, old: a.old_string, new: a.new_string })
+                Ok(Action::EditFile {
+                    path: a.path,
+                    old: a.old_string,
+                    new: a.new_string,
+                })
             }
             "apply_patch" => {
                 let a: PatchArgs = serde_json::from_value(v)?;
@@ -204,9 +286,14 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
             }
             "write_process" => {
                 let a: WriteProcessArgs = serde_json::from_value(v)?;
-                anyhow::ensure!(a.eof || a.input.is_some(), "input is required unless eof=true");
-                anyhow::ensure!(!a.eof || a.input.as_deref().unwrap_or_default().is_empty(),
-                    "EOF requires empty input");
+                anyhow::ensure!(
+                    a.eof || a.input.is_some(),
+                    "input is required unless eof=true"
+                );
+                anyhow::ensure!(
+                    !a.eof || a.input.as_deref().unwrap_or_default().is_empty(),
+                    "EOF requires empty input"
+                );
                 Ok(Action::WriteProcess {
                     id: a.id,
                     input: a.input.unwrap_or_default(),
@@ -230,11 +317,37 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
             }
             "grep" => {
                 let a: GrepArgs = serde_json::from_value(v)?;
-                Ok(Action::Grep { pattern: a.pattern, path: a.path, ignore_case: a.ignore_case, context: a.context })
+                Ok(Action::Grep {
+                    pattern: a.pattern,
+                    path: a.path,
+                    ignore_case: a.ignore_case,
+                    context: a.context,
+                    regex: a.regex,
+                })
+            }
+            "git" => {
+                let a: GitArgs = serde_json::from_value(v)?;
+                let sub = a.subcommand.trim().to_lowercase();
+                if !GIT_SUBCOMMANDS.contains(&sub.as_str()) {
+                    bail!(
+                        "unsupported git subcommand '{}' — use one of: {}",
+                        a.subcommand,
+                        GIT_SUBCOMMANDS.join(", ")
+                    );
+                }
+                Ok(Action::Git {
+                    subcommand: sub,
+                    path: a.path,
+                    rev: a.rev,
+                    limit: a.limit,
+                })
             }
             "glob" => {
                 let a: GlobArgs = serde_json::from_value(v)?;
-                Ok(Action::Glob { pattern: a.pattern, path: a.path })
+                Ok(Action::Glob {
+                    pattern: a.pattern,
+                    path: a.path,
+                })
             }
             // Canonical name first; legacy alias kept for old sessions.
             "update_plan" | "todo_write" => {
@@ -243,7 +356,10 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                         todos: a
                             .plan
                             .into_iter()
-                            .map(|t| TodoItem { content: t.step, status: t.status })
+                            .map(|t| TodoItem {
+                                content: t.step,
+                                status: t.status,
+                            })
                             .collect(),
                     })
                 } else {
@@ -252,7 +368,10 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                         todos: a
                             .todos
                             .into_iter()
-                            .map(|t| TodoItem { content: t.content, status: t.status })
+                            .map(|t| TodoItem {
+                                content: t.content,
+                                status: t.status,
+                            })
                             .collect(),
                     })
                 }
@@ -282,12 +401,21 @@ impl Action {
                 format!("write {} ({} bytes)", path, content.len())
             }
             Action::EditFile { path, old, new } => {
-                format!("edit {} (-{} +{} lines)", path, old.lines().count(), new.lines().count())
+                format!(
+                    "edit {} (-{} +{} lines)",
+                    path,
+                    old.lines().count(),
+                    new.lines().count()
+                )
             }
             Action::ApplyPatch { patch } => match crate::patch::parse_patch(patch) {
                 Ok(hunks) => format!(
                     "apply_patch: {}",
-                    hunks.iter().map(|h| h.describe()).collect::<Vec<_>>().join("; ")
+                    hunks
+                        .iter()
+                        .map(|h| h.describe())
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 ),
                 Err(_) => "apply_patch (unparseable patch)".to_string(),
             },
@@ -298,15 +426,27 @@ impl Action {
                 if *eof && input.is_empty() {
                     format!("close stdin of process #{id}")
                 } else {
-                    format!("write to process #{id}: {}", input.lines().next().unwrap_or(""))
+                    format!(
+                        "write to process #{id}: {}",
+                        input.lines().next().unwrap_or("")
+                    )
                 }
             }
             Action::StopProcess { id } => format!("stop process #{id}"),
             Action::FetchUrl { url } => format!("fetch {url}"),
             Action::WebSearch { query, .. } => format!("web search: {query}"),
-            Action::Grep { pattern, path, ignore_case, context } => {
+            Action::Grep {
+                pattern,
+                path,
+                ignore_case,
+                context,
+                regex,
+            } => {
                 let where_ = path.as_deref().unwrap_or(".");
                 let mut flags = String::new();
+                if *regex {
+                    flags.push_str(" (regex)");
+                }
                 if *ignore_case {
                     flags.push_str(" (i)");
                 }
@@ -318,6 +458,24 @@ impl Action {
             Action::Glob { pattern, path } => {
                 let where_ = path.as_deref().unwrap_or(".");
                 format!("glob '{pattern}' in {where_}")
+            }
+            Action::Git {
+                subcommand,
+                path,
+                rev,
+                limit,
+            } => {
+                let mut s = format!("git {subcommand}");
+                if let Some(r) = rev {
+                    s.push_str(&format!(" {r}"));
+                }
+                if let Some(p) = path {
+                    s.push_str(&format!(" -- {p}"));
+                }
+                if let Some(n) = limit {
+                    s.push_str(&format!(" (max {n})"));
+                }
+                s
             }
             Action::UpdatePlan { todos } => {
                 let done = todos.iter().filter(|t| t.status == "completed").count();
@@ -335,10 +493,20 @@ impl Action {
                 | Action::ViewImage { .. }
                 | Action::Grep { .. }
                 | Action::Glob { .. }
+                | Action::Git { .. }
                 | Action::UpdatePlan { .. }
                 | Action::FetchUrl { .. }
                 | Action::PollProcess { .. }
                 | Action::WebSearch { .. }
+        )
+    }
+
+    /// True when this action can change files on disk (drives post-edit
+    /// hooks and the undo snapshots).
+    pub fn mutates_files(&self) -> bool {
+        matches!(
+            self,
+            Action::WriteFile { .. } | Action::EditFile { .. } | Action::ApplyPatch { .. }
         )
     }
 
@@ -351,6 +519,7 @@ impl Action {
             | Action::WebSearch { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
+            | Action::Git { .. }
             | Action::PollProcess { .. }
             | Action::UpdatePlan { .. } => Danger::Safe,
             Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
@@ -446,8 +615,12 @@ impl Action {
                     .with_context(|| format!("writing {}", p.display()))?;
                 let diff = crate::diff::unified_diff(path, &raw, &updated, 3);
                 Ok((
-                    format!("edited {} (-{} +{} lines)",
-                        p.display(), old.lines().count(), new.lines().count()),
+                    format!(
+                        "edited {} (-{} +{} lines)",
+                        p.display(),
+                        old.lines().count(),
+                        new.lines().count()
+                    ),
                     if diff.is_empty() { vec![] } else { vec![diff] },
                 ))
             }
@@ -483,16 +656,22 @@ impl Action {
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<String> {
         match self {
-            Action::ViewImage { .. } => bail!("view_image requires the agent's vision-message handler"),
+            Action::ViewImage { .. } => {
+                bail!("view_image requires the agent's vision-message handler")
+            }
             Action::ListDir { path } => {
                 let root = resolve_in(cwd, path)?;
                 let tree = build_tree(&root, 0, 2);
                 Ok(tree)
             }
-            Action::ReadFile { path, offset, limit } => {
+            Action::ReadFile {
+                path,
+                offset,
+                limit,
+            } => {
                 let p = resolve_in(cwd, path)?;
-                let meta = std::fs::metadata(&p)
-                    .with_context(|| format!("stat {}", p.display()))?;
+                let meta =
+                    std::fs::metadata(&p).with_context(|| format!("stat {}", p.display()))?;
                 if meta.is_dir() {
                     return Ok(format!("[directory] {}", build_tree(&p, 0, 1)));
                 }
@@ -559,23 +738,35 @@ impl Action {
             Action::WriteFile { .. } | Action::EditFile { .. } | Action::ApplyPatch { .. } => {
                 unreachable!("mutating actions are intercepted by perform_with_diff")
             }
-            Action::RunCommand { command } => {
-                run_shell_cancellable(command, cwd, cancel).await
-            }
-            Action::StartProcess { .. } | Action::PollProcess { .. }
-            | Action::WriteProcess { .. } | Action::StopProcess { .. } => {
+            Action::RunCommand { command } => run_shell_cancellable(command, cwd, cancel).await,
+            Action::StartProcess { .. }
+            | Action::PollProcess { .. }
+            | Action::WriteProcess { .. }
+            | Action::StopProcess { .. } => {
                 bail!("process tools require an owning agent")
             }
             Action::FetchUrl { url } => fetch_url(url).await,
             Action::WebSearch { query, max_results } => web_search(query, *max_results).await,
-            Action::Grep { pattern, path, ignore_case, context } => {
+            Action::Grep {
+                pattern,
+                path,
+                ignore_case,
+                context,
+                regex,
+            } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
-                run_grep(&root, pattern, *ignore_case, context.unwrap_or(0))
+                run_grep(&root, pattern, *ignore_case, context.unwrap_or(0), *regex)
             }
             Action::Glob { pattern, path } => {
                 let root = resolve_in(cwd, path.as_deref().unwrap_or("."))?;
                 run_glob(&root, pattern)
             }
+            Action::Git {
+                subcommand,
+                path,
+                rev,
+                limit,
+            } => run_git(cwd, subcommand, path.as_deref(), rev.as_deref(), *limit).await,
             // The host (REPL) keeps the authoritative plan state; the model
             // only needs confirmation that the list was recorded.
             Action::UpdatePlan { todos } => {
@@ -594,13 +785,59 @@ impl Action {
     }
 }
 
+/// Run one `[hooks] post_edit` command. The touched paths are exported as
+/// `LAUDACODE_CHANGED_FILES` (newline separated) so hooks can be generic
+/// (`cargo fmt`, `cargo test`) without the agent re-running them. Output uses
+/// the same `[exit: N]` report shape as `run_shell`.
+pub async fn run_hook(
+    command: &str,
+    cwd: &Path,
+    touched: &[String],
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let files = touched.join("\n");
+    let child = spawn_shell(cwd, command, &[("LAUDACODE_CHANGED_FILES", &files)])?;
+    capture_child(
+        child,
+        None,
+        timeout,
+        "interrupted while running hook",
+        "hook",
+    )
+    .await
+}
+
 /// Recursive grep over text files, skipping binaries and junk dirs.
 /// `context` > 0 includes that many surrounding lines per hit, groups
-/// separated by `--` (grep -C style).
-fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Result<String> {
+/// separated by `--` (grep -C style). With `regex` the pattern is compiled as
+/// a regular expression; otherwise it is matched as literal text (the default,
+/// so patterns like `foo(bar)` keep working verbatim).
+fn run_grep(
+    root: &Path,
+    pattern: &str,
+    ignore_case: bool,
+    context: u32,
+    regex: bool,
+) -> Result<String> {
     const MAX_HITS: usize = 200;
     const MAX_OUTPUT_LINES: usize = 400;
-    let needle = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+    // Compiled matcher, or `None` for the literal fast path.
+    let compiled = if regex {
+        Some(
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(ignore_case)
+                .size_limit(1 << 20)
+                .build()
+                .with_context(|| format!("invalid regex pattern: {pattern}"))?,
+        )
+    } else {
+        None
+    };
+    let needle = if compiled.is_none() && ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
     // (relative path, 1-based line no, line text) for each hit.
     let mut hits: Vec<(String, usize, String)> = Vec::new();
     let mut files_searched = 0usize;
@@ -610,7 +847,9 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Resu
             stop = true;
             return false; // halt the whole walk
         }
-        let Ok(raw) = std::fs::read(p) else { return true };
+        let Ok(raw) = std::fs::read(p) else {
+            return true;
+        };
         if raw.len() as u64 > MAX_READ_BYTES || raw.contains(&0u8) {
             return true; // skip huge or binary files
         }
@@ -618,10 +857,10 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Resu
         files_searched += 1;
         let rel = p.strip_prefix(root).unwrap_or(p).display().to_string();
         for (i, line) in text.lines().enumerate() {
-            let hit = if ignore_case {
-                line.to_lowercase().contains(&needle)
-            } else {
-                line.contains(&needle)
+            let hit = match &compiled {
+                Some(re) => re.is_match(line),
+                None if ignore_case => line.to_lowercase().contains(&needle),
+                None => line.contains(&needle),
             };
             if hit {
                 hits.push((rel.clone(), i + 1, line.trim_end().to_string()));
@@ -635,11 +874,12 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Resu
     });
 
     if hits.is_empty() {
-        let hint = if pattern.contains(['.', '*', '+', '?', '(', '[', '|', '^', '$']) {
-            "\nnote: this tool searches for literal text — regex metachars are matched as-is"
-        } else {
-            ""
-        };
+        let hint =
+            if !regex && pattern.contains(['.', '*', '+', '?', '(', '[', '|', '^', '$', '\\']) {
+                "\nnote: patterns are matched literally — pass regex=true to use regex syntax"
+            } else {
+                ""
+            };
         return Ok(format!(
             "no matches for '{pattern}' ({files_searched} files searched){hint}"
         ));
@@ -663,7 +903,10 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Resu
         let mut by_file: std::collections::BTreeMap<String, Vec<(usize, String)>> =
             std::collections::BTreeMap::new();
         for (rel, n, line) in &hits {
-            by_file.entry(rel.clone()).or_default().push((*n, line.clone()));
+            by_file
+                .entry(rel.clone())
+                .or_default()
+                .push((*n, line.clone()));
         }
         'files: for (rel, mut lines) in by_file {
             lines.sort_by_key(|(n, _)| *n);
@@ -686,7 +929,9 @@ fn run_grep(root: &Path, pattern: &str, ignore_case: bool, context: u32) -> Resu
                     // contiguous — no separator
                 }
                 let src = root.join(&rel);
-                let Ok(content) = std::fs::read_to_string(&src) else { continue };
+                let Ok(content) = std::fs::read_to_string(&src) else {
+                    continue;
+                };
                 for ln in start..=end {
                     if out_lines >= MAX_OUTPUT_LINES {
                         break 'files;
@@ -775,7 +1020,11 @@ fn glob_match(pattern: &str, path: &str) -> bool {
             }
             false
         } else {
-            !path.is_empty() && seg_match(&pat[0].chars().collect::<Vec<_>>(), &path[0].chars().collect::<Vec<_>>())
+            !path.is_empty()
+                && seg_match(
+                    &pat[0].chars().collect::<Vec<_>>(),
+                    &path[0].chars().collect::<Vec<_>>(),
+                )
                 && match_segs(&pat[1..], &path[1..])
         }
     }
@@ -791,7 +1040,11 @@ pub fn resolve_path_in(cwd: &Path, path: &str) -> Result<PathBuf> {
 
 fn resolve_in(cwd: &Path, path: &str) -> Result<PathBuf> {
     let p = Path::new(path);
-    let resolved = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
     // Normalize "..".
     let mut out = PathBuf::new();
     for comp in resolved.components() {
@@ -846,7 +1099,20 @@ pub async fn run_shell_cancellable(
     cwd: &Path,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<String> {
-    use tokio::io::AsyncReadExt;
+    let child = spawn_shell(cwd, command, &[])?;
+    capture_child(
+        child,
+        cancel,
+        std::time::Duration::from_secs(180),
+        "interrupted while running command",
+        "command",
+    )
+    .await
+}
+
+/// `sh -c <command>` in `cwd`, stdin closed and both streams piped, with the
+/// child in its own process group so a kill takes the whole tree.
+fn spawn_shell(cwd: &Path, command: &str, envs: &[(&str, &str)]) -> Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -854,15 +1120,30 @@ pub async fn run_shell_cancellable(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().context("spawning shell (sh)")?;
+    cmd.spawn().context("spawning shell (sh)")
+}
 
+/// Drain a spawned child's stdout/stderr, honouring a timeout and a
+/// cooperative cancel flag. Shared by `sh -c` and the direct-exec tools
+/// (`git`) so both report output in the same `[exit: N]` format.
+async fn capture_child(
+    child: tokio::process::Child,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    timeout: std::time::Duration,
+    cancel_msg: &str,
+    what: &str,
+) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut child = child;
     let mut out_buf = Vec::new();
     let mut err_buf = Vec::new();
     // Drain both pipes concurrently: reading them sequentially deadlocks
     // once a child fills one pipe buffer while we block on the other.
-    let timeout = tokio::time::Duration::from_secs(180);
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
     // Cancellation poller: races the normal completion path; on cancel the
@@ -897,7 +1178,7 @@ pub async fn run_shell_cancellable(
                 unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
             }
             let _ = child.kill().await;
-            bail!("interrupted while running command");
+            bail!("{cancel_msg}");
         }
     };
 
@@ -905,7 +1186,7 @@ pub async fn run_shell_cancellable(
         Ok(s) => s.context("waiting for command")?,
         Err(_) => {
             let _ = child.kill().await;
-            bail!("command timed out after {}s", timeout.as_secs())
+            bail!("{what} timed out after {}s", timeout.as_secs())
         }
     };
 
@@ -930,6 +1211,88 @@ pub async fn run_shell_cancellable(
     Ok(report)
 }
 
+/// Run one of `GIT_SUBCOMMANDS` against `cwd`. Arguments are passed as a real
+/// argv (never a shell string), so model-supplied paths/revs cannot inject
+/// extra commands. `path` is a repo-relative pathspec, `rev` a revision or
+/// range (`HEAD~3..HEAD`), and `limit` caps log output.
+async fn run_git(
+    cwd: &Path,
+    subcommand: &str,
+    path: Option<&str>,
+    rev: Option<&str>,
+    limit: Option<u32>,
+) -> Result<String> {
+    anyhow::ensure!(
+        GIT_SUBCOMMANDS.contains(&subcommand),
+        "unsupported git subcommand '{subcommand}'"
+    );
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg(subcommand).current_dir(cwd);
+    match subcommand {
+        // Porcelain + branch header: stable, cheap, ideal for the model.
+        "status" => {
+            cmd.args(["--short", "--branch"]);
+            if let Some(p) = path {
+                cmd.arg("--").arg(p);
+            }
+        }
+        "log" => {
+            let n = limit.unwrap_or(20).clamp(1, 500);
+            cmd.arg(format!("--max-count={n}"))
+                .arg("--date=short")
+                .arg("--pretty=format:%h %ad %an %s");
+            if let Some(r) = rev {
+                cmd.arg(r);
+            }
+            if let Some(p) = path {
+                cmd.arg("--").arg(p);
+            }
+        }
+        "diff" => {
+            if let Some(r) = rev {
+                cmd.arg(r);
+            }
+            if let Some(p) = path {
+                cmd.arg("--").arg(p);
+            }
+        }
+        "show" => {
+            cmd.arg(rev.unwrap_or("HEAD"));
+            if let Some(p) = path {
+                cmd.arg("--").arg(p);
+            }
+        }
+        "blame" => {
+            let p = path.context("git blame needs a `path` to annotate")?;
+            cmd.args(["--date=short", "-w"]);
+            if let Some(r) = rev {
+                cmd.arg(r);
+            }
+            cmd.arg("--").arg(p);
+        }
+        _ => unreachable!("subcommand validated above"),
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd
+        .spawn()
+        .context("spawning git — is it installed and on PATH?")?;
+    let report = capture_child(
+        child,
+        None,
+        std::time::Duration::from_secs(60),
+        "interrupted while running git",
+        "git",
+    )
+    .await?;
+    // A non-zero exit is informative (not a crash): keep it, prefixed so the
+    // model can tell "no commits yet" from a real failure.
+    Ok(report)
+}
+
 fn truncate(s: &str) -> String {
     if s.chars().count() <= MAX_TOOL_OUTPUT {
         s.to_string()
@@ -949,11 +1312,10 @@ async fn fetch_url(url: &str) -> Result<String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         bail!("only http(s) URLs are supported");
     }
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("laudacode/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(45))
-        .build()?;
+    let client = crate::api::build_web_client(
+        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(45),
+    )?;
     let resp = client.get(url).send().await.context("request failed")?;
     let status = resp.status();
     if let Some(len) = resp.content_length() {
@@ -998,14 +1360,16 @@ async fn fetch_url(url: &str) -> Result<String> {
 /// `fetch_url` for the pages that matter.
 async fn web_search(query: &str, max_results: usize) -> Result<String> {
     use futures_util::StreamExt;
-    let url = "https://html.duckduckgo.com/html/?q=".to_string()
-        + &urlencoding(query);
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("laudacode/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(45))
-        .build()?;
-    let resp = client.get(&url).send().await.context("search request failed")?;
+    let url = "https://html.duckduckgo.com/html/?q=".to_string() + &urlencoding(query);
+    let client = crate::api::build_web_client(
+        std::time::Duration::from_secs(20),
+        std::time::Duration::from_secs(45),
+    )?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("search request failed")?;
     let status = resp.status();
     let mut body: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut stream = resp.bytes_stream();
@@ -1019,13 +1383,17 @@ async fn web_search(query: &str, max_results: usize) -> Result<String> {
     let html = String::from_utf8_lossy(&body).into_owned();
     let results = parse_ddg_results(&html, max_results);
     if results.is_empty() {
-        return Ok(format!("[web_search] no results for \"{query}\" [HTTP {status}]"));
+        return Ok(format!(
+            "[web_search] no results for \"{query}\" [HTTP {status}]"
+        ));
     }
     let mut out = String::new();
     for (i, (title, link)) in results.iter().enumerate() {
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, link));
     }
-    Ok(format!("[web_search: {query}] [HTTP {status}]\n{out}").trim().to_string())
+    Ok(format!("[web_search: {query}] [HTTP {status}]\n{out}")
+        .trim()
+        .to_string())
 }
 
 /// Naive DuckDuckGo HTML result parser: extracts `result__a` anchors.
@@ -1085,7 +1453,9 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
         let end = r.find('"')?;
         r[..end].to_string()
     } else {
-        let end = rest2.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest2.len());
+        let end = rest2
+            .find(|c: char| c.is_whitespace() || c == '>')
+            .unwrap_or(rest2.len());
         rest2[..end].trim().to_string()
     };
     // DuckDuckGo returns redirect URLs wrapped in //duckduckgo.com/l/?uddg=...
@@ -1151,7 +1521,9 @@ fn strip_html(s: &str) -> String {
             _ => {}
         }
     }
-    out.replace("&amp;", "&").replace("&#x27;", "'").replace("&quot;", "\"")
+    out.replace("&amp;", "&")
+        .replace("&#x27;", "'")
+        .replace("&quot;", "\"")
 }
 
 /// Minimal HTML → text conversion (no regex dependency).
@@ -1187,7 +1559,9 @@ fn html_to_text(html: &str) -> String {
                     }
                 }
                 "br" | "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                | "section" | "article" | "pre" if skip_tag == 0 => {
+                | "section" | "article" | "pre"
+                    if skip_tag == 0 =>
+                {
                     out.push('\n');
                 }
                 _ => {}
@@ -1209,7 +1583,9 @@ fn html_to_text(html: &str) -> String {
                         "apos" => Some('\''),
                         "nbsp" => Some(' '),
                         e if e.starts_with("#x") || e.starts_with("#X") => {
-                            u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32)
+                            u32::from_str_radix(&e[2..], 16)
+                                .ok()
+                                .and_then(char::from_u32)
                         }
                         e if e.starts_with('#') => {
                             e[1..].parse::<u32>().ok().and_then(char::from_u32)
@@ -1257,12 +1633,40 @@ fn html_to_text(html: &str) -> String {
 }
 
 const DANGEROUS_PATTERNS: &[&str] = &[
-    "sudo ", "sudo\t", "mkfs", "dd if=", ":(){", "fork()", "shutdown", "reboot",
-    "halt", "init 0", "chmod -r 777 /", "chown -r", "> /dev/sd", "/dev/mem",
-    "| sh", "| bash", "|zsh", "| zsh", "|sh", "| bash -", "curl |", "wget |",
-    "git push --force", "git push -f", "history -c", "kill -9 1", "killall -9",
-    " -delete", "git reset --hard", "git clean -fd", "drop table",
-    "truncate -s 0 /", "mkswap", "base64 -d |",
+    "sudo ",
+    "sudo\t",
+    "mkfs",
+    "dd if=",
+    ":(){",
+    "fork()",
+    "shutdown",
+    "reboot",
+    "halt",
+    "init 0",
+    "chmod -r 777 /",
+    "chown -r",
+    "> /dev/sd",
+    "/dev/mem",
+    "| sh",
+    "| bash",
+    "|zsh",
+    "| zsh",
+    "|sh",
+    "| bash -",
+    "curl |",
+    "wget |",
+    "git push --force",
+    "git push -f",
+    "history -c",
+    "kill -9 1",
+    "killall -9",
+    " -delete",
+    "git reset --hard",
+    "git clean -fd",
+    "drop table",
+    "truncate -s 0 /",
+    "mkswap",
+    "base64 -d |",
 ];
 
 pub fn is_dangerous_command(cmd: &str) -> bool {
@@ -1273,8 +1677,12 @@ pub fn is_dangerous_command(cmd: &str) -> bool {
         }
     }
     // rm -rf targeting root/home/system-ish paths.
-    if lower.contains("rm ") && (lower.contains("-rf") || lower.contains("-fr") || lower.contains("-r -f")) {
-        let targets_root = [" /", "~/", "$home", "/*", "/etc", "/usr", "/var", "/system", "/data"];
+    if lower.contains("rm ")
+        && (lower.contains("-rf") || lower.contains("-fr") || lower.contains("-r -f"))
+    {
+        let targets_root = [
+            " /", "~/", "$home", "/*", "/etc", "/usr", "/var", "/system", "/data",
+        ];
         if targets_root.iter().any(|t| {
             lower.contains(&format!("rm{t}"))
                 || lower.contains(&format!("rm -rf{t}"))
@@ -1288,8 +1696,19 @@ pub fn is_dangerous_command(cmd: &str) -> bool {
 }
 
 const SKIP_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "dist", "build", "__pycache__",
-    ".venv", "venv", "vendor", ".cache", ".gradle", ".idea", ".next",
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "vendor",
+    ".cache",
+    ".gradle",
+    ".idea",
+    ".next",
 ];
 
 /// Recursive directory listing used by both list_dir and the initial context.
@@ -1486,16 +1905,34 @@ pub fn tool_defs() -> Vec<ToolDef> {
             r#type: "function",
             function: FunctionDef {
                 name: "grep",
-                description: "Search file contents with a literal string (not regex) across the project. Skips binaries, .git, target/, node_modules/. Returns file:line: match.",
+                description: "Search file contents across the project and return file:line: match. By default the pattern is matched as literal text; set regex=true for regular expressions (Rust/PCRE-ish syntax: \\d \\w \\s, alternation, anchors). Skips binaries, .git, target/, node_modules/. Combine with context=N for surrounding lines.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": {"type": "string", "description": "Literal text to search for"},
+                        "pattern": {"type": "string", "description": "Text to search for (literal, or a regex when regex=true)"},
                         "path": {"type": "string", "description": "Directory or file to search, relative to cwd. Optional."},
                         "ignore_case": {"type": "boolean", "description": "Case-insensitive search"},
-                        "context": {"type": "integer", "description": "Lines of context around each match (grep -C)"}
+                        "context": {"type": "integer", "description": "Lines of context around each match (grep -C)"},
+                        "regex": {"type": "boolean", "description": "Treat pattern as a regular expression instead of literal text (default false)"}
                     },
                     "required": ["pattern"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
+                name: "git",
+                description: "Read-only git inspection. subcommand is one of: status (short porcelain + branch), log (oneline history, newest first), diff (working-tree or vs a rev), show (one commit/its diff), blame (line authors for a file). Optionally restrict with a pathspec `path` and a revision/range `rev`; cap log lines with `limit` (default 20). Use this to understand history and current changes without running raw git in a shell.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "subcommand": {"type": "string", "enum": GIT_SUBCOMMANDS, "description": "Read-only git subcommand"},
+                        "path": {"type": "string", "description": "Optional repo-relative pathspec to limit the result"},
+                        "rev": {"type": "string", "description": "Optional revision or range, e.g. HEAD, HEAD~3, main, HEAD~5..HEAD"},
+                        "limit": {"type": "integer", "description": "Max entries for log (default 20, max 500)"}
+                    },
+                    "required": ["subcommand"]
                 }),
             },
         },
@@ -1606,7 +2043,7 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
         .filter(|t| {
             matches!(
                 t.function.name,
-                "list_dir" | "read_file" | "view_image" | "grep" | "glob" | "fetch_url"
+                "list_dir" | "read_file" | "view_image" | "grep" | "glob" | "fetch_url" | "git"
             )
         })
         .collect()
@@ -1617,7 +2054,9 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
 /// stop early once result caps are reached instead of grinding through huge
 /// trees like node_modules).
 pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) {
-    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
     let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
@@ -1666,6 +2105,80 @@ mod tests {
     }
 
     #[test]
+    fn grep_literal_by_default_and_regex_on_request() {
+        let dir = std::env::temp_dir().join(format!("lc-grep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "let total = 41;\nlet x = 7;\n").unwrap();
+        // Literal (default): the metacharacters are matched as-is.
+        let literal = run_grep(&dir, r"\d+", false, 0, false).unwrap();
+        assert!(
+            literal.contains("no matches"),
+            "literal mode must not interpret regex: {literal}"
+        );
+        // Regex: \d+ matches the numbers.
+        let re = run_grep(&dir, r"\d+", false, 0, true).unwrap();
+        assert!(re.contains("a.rs:1: let total = 41;"), "{re}");
+        assert!(re.contains("a.rs:2: let x = 7;"), "{re}");
+        // Regex ignore_case.
+        let ic = run_grep(&dir, "LET", true, 0, true).unwrap();
+        assert!(ic.contains("2 matches"), "{ic}");
+        // Context window rendering still works in regex mode.
+        let ctx = run_grep(&dir, r"let x", false, 1, true).unwrap();
+        assert!(
+            ctx.contains("a.rs-1-let total = 41;"),
+            "context line: {ctx}"
+        );
+        assert!(ctx.contains("a.rs:2:let x = 7;"), "hit line: {ctx}");
+        // An invalid regex is a clean error, not a panic.
+        assert!(run_grep(&dir, "(unclosed", false, 0, true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_tool_parses_and_classifies_read_only() {
+        let cwd = std::env::current_dir().unwrap();
+        let args = r#"{"subcommand":"status"}"#;
+        match parse_tool_action("git", args).unwrap() {
+            Action::Git {
+                subcommand,
+                path,
+                rev,
+                limit,
+            } => {
+                assert_eq!(subcommand, "status");
+                assert!(path.is_none() && rev.is_none() && limit.is_none());
+            }
+            other => panic!("wrong action: {other:?}"),
+        }
+        // Lowercasing + limit passthrough.
+        match parse_tool_action(
+            "git",
+            r#"{"subcommand":"LOG","limit":5,"rev":"HEAD~2..HEAD"}"#,
+        )
+        .unwrap()
+        {
+            Action::Git {
+                subcommand,
+                rev,
+                limit,
+                ..
+            } => {
+                assert_eq!(subcommand, "log");
+                assert_eq!(rev.as_deref(), Some("HEAD~2..HEAD"));
+                assert_eq!(limit, Some(5));
+            }
+            other => panic!("wrong action: {other:?}"),
+        }
+        let a = parse_tool_action("git", args).unwrap();
+        assert!(a.is_read_only(), "git reads are read-only");
+        assert_eq!(a.danger(&cwd), Danger::Safe);
+        // Mutating git subcommands are refused outright.
+        assert!(parse_tool_action("git", r#"{"subcommand":"push"}"#).is_err());
+        assert!(parse_tool_action("git", r#"{"subcommand":"reset","rev":"--hard"}"#).is_err());
+        assert!(parse_tool_action("git", "{}").is_err());
+    }
+
+    #[test]
     fn grep_danger_detection() {
         assert!(is_dangerous_command("sudo rm -rf /"));
         assert!(is_dangerous_command("rm -rf ~"));
@@ -1693,13 +2206,19 @@ mod tests {
         assert!(poll.is_read_only());
         let write = parse_tool_action("write_process", r#"{"id":1,"input":"hello"}"#).unwrap();
         assert_eq!(write.danger(&cwd), Danger::High);
-        assert!(matches!(parse_tool_action("write_process", r#"{"id":1,"eof":true}"#).unwrap(),
-            Action::WriteProcess { eof: true, .. }));
+        assert!(matches!(
+            parse_tool_action("write_process", r#"{"id":1,"eof":true}"#).unwrap(),
+            Action::WriteProcess { eof: true, .. }
+        ));
         assert!(parse_tool_action("write_process", r#"{"id":1}"#).is_err());
-        assert!(parse_tool_action("write_process", r#"{"id":1,"input":"lost","eof":true}"#).is_err());
+        assert!(
+            parse_tool_action("write_process", r#"{"id":1,"input":"lost","eof":true}"#).is_err()
+        );
         assert!(parse_tool_action("poll_process", r#"{"id":-1}"#).is_err());
-        assert!(matches!(parse_tool_action("stop_process", r#"{"id":1}"#).unwrap(),
-            Action::StopProcess { id: 1 }));
+        assert!(matches!(
+            parse_tool_action("stop_process", r#"{"id":1}"#).unwrap(),
+            Action::StopProcess { id: 1 }
+        ));
     }
 
     #[test]
@@ -1724,23 +2243,44 @@ mod tests {
         let base = std::env::temp_dir().join(format!("lc-danger-{}", std::process::id()));
         let cwd = base.join("proj");
         std::fs::create_dir_all(cwd.join("src")).unwrap();
-        let inside = Action::WriteFile { path: "src/x.rs".into(), content: "".into() };
-        let outside = Action::WriteFile { path: "/etc/hosts".into(), content: "".into() };
+        let inside = Action::WriteFile {
+            path: "src/x.rs".into(),
+            content: "".into(),
+        };
+        let outside = Action::WriteFile {
+            path: "/etc/hosts".into(),
+            content: "".into(),
+        };
         assert_eq!(inside.danger(&cwd), Danger::Moderate);
         assert_eq!(outside.danger(&cwd), Danger::High);
-        let edit_escape = Action::EditFile { path: "../../escape".into(), old: "a".into(), new: "b".into() };
+        let edit_escape = Action::EditFile {
+            path: "../../escape".into(),
+            old: "a".into(),
+            new: "b".into(),
+        };
         assert_eq!(edit_escape.danger(&cwd), Danger::High);
         // Symlink inside the workspace pointing OUT must classify as High.
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/etc", cwd.join("escape-link")).unwrap();
-            let via_link = Action::WriteFile { path: "escape-link/passwd".into(), content: "".into() };
-            assert_eq!(via_link.danger(&cwd), Danger::High, "symlink escape must be caught");
+            let via_link = Action::WriteFile {
+                path: "escape-link/passwd".into(),
+                content: "".into(),
+            };
+            assert_eq!(
+                via_link.danger(&cwd),
+                Danger::High,
+                "symlink escape must be caught"
+            );
         }
         // apply_patch touching an outside path is High too.
-        let outside_patch = Action::ApplyPatch { patch: "*** Begin Patch\n*** Add File: /etc/lc-pwned\n+x\n*** End Patch".into() };
+        let outside_patch = Action::ApplyPatch {
+            patch: "*** Begin Patch\n*** Add File: /etc/lc-pwned\n+x\n*** End Patch".into(),
+        };
         assert_eq!(outside_patch.danger(&cwd), Danger::High);
-        let inside_patch = Action::ApplyPatch { patch: "*** Begin Patch\n*** Update File: src/x.rs\n@@\n-a\n+b\n*** End Patch".into() };
+        let inside_patch = Action::ApplyPatch {
+            patch: "*** Begin Patch\n*** Update File: src/x.rs\n@@\n-a\n+b\n*** End Patch".into(),
+        };
         assert_eq!(inside_patch.danger(&cwd), Danger::Moderate);
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1749,14 +2289,28 @@ mod tests {
     fn read_file_pages_with_line_numbers() {
         let dir = std::env::temp_dir().join(format!("lc-read-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let body = (1..=30).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let body = (1..=30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.join("f.txt"), &body).unwrap();
-        let full = perform_sync(Action::ReadFile { path: "f.txt".into(), offset: None, limit: None }, &dir);
+        let full = perform_sync(
+            Action::ReadFile {
+                path: "f.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            &dir,
+        );
         assert!(full.contains("    1| line1"));
         assert!(full.contains("   30| line30"));
 
         let page = perform_sync(
-            Action::ReadFile { path: "f.txt".into(), offset: Some(25), limit: Some(3) },
+            Action::ReadFile {
+                path: "f.txt".into(),
+                offset: Some(25),
+                limit: Some(3),
+            },
             &dir,
         );
         assert!(page.contains("   25| line25"), "{page}");
@@ -1782,12 +2336,22 @@ mod tests {
             other => panic!("wrong action: {other:?}"),
         }
         // Legacy todo_write shape from old sessions still parses.
-        match parse_tool_action("todo_write", r#"{"todos":[{"content":"x","status":"pending"}]}"#).unwrap() {
+        match parse_tool_action(
+            "todo_write",
+            r#"{"todos":[{"content":"x","status":"pending"}]}"#,
+        )
+        .unwrap()
+        {
             Action::UpdatePlan { todos } => assert_eq!(todos[0].content, "x"),
             other => panic!("wrong action: {other:?}"),
         }
         // apply_patch parses through the same entry point.
-        match parse_tool_action("apply_patch", r#"{"patch":"*** Begin Patch\n*** Delete File: z\n*** End Patch"}"#).unwrap() {
+        match parse_tool_action(
+            "apply_patch",
+            r#"{"patch":"*** Begin Patch\n*** Delete File: z\n*** End Patch"}"#,
+        )
+        .unwrap()
+        {
             Action::ApplyPatch { .. } => {}
             other => panic!("wrong action: {other:?}"),
         }
@@ -1815,9 +2379,17 @@ mod tests {
 
     #[test]
     fn parse_tool_actions_roundtrip() {
-        match parse_tool_action("edit_file", r#"{"path":"a.rs","old_string":"x","new_string":"y"}"#).unwrap() {
+        match parse_tool_action(
+            "edit_file",
+            r#"{"path":"a.rs","old_string":"x","new_string":"y"}"#,
+        )
+        .unwrap()
+        {
             Action::EditFile { path, old, new } => {
-                assert_eq!((path.as_str(), old.as_str(), new.as_str()), ("a.rs", "x", "y"));
+                assert_eq!(
+                    (path.as_str(), old.as_str(), new.as_str()),
+                    ("a.rs", "x", "y")
+                );
             }
             other => panic!("wrong action: {other:?}"),
         }
@@ -1866,7 +2438,10 @@ mod tests {
             full_redirect("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdoc&rut=xyz"),
             "https://example.com/doc"
         );
-        assert_eq!(strip_html("<a class=\"result__a\">Title &amp; More</a>"), "Title & More");
+        assert_eq!(
+            strip_html("<a class=\"result__a\">Title &amp; More</a>"),
+            "Title & More"
+        );
     }
 
     #[test]

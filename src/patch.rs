@@ -37,9 +37,18 @@ pub struct Chunk {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)] // Add*/Update*/Delete* naming is part of the format
 pub enum Hunk {
-    AddFile { path: PathBuf, contents: String },
-    DeleteFile { path: PathBuf },
-    UpdateFile { path: PathBuf, move_path: Option<PathBuf>, chunks: Vec<Chunk> },
+    AddFile {
+        path: PathBuf,
+        contents: String,
+    },
+    DeleteFile {
+        path: PathBuf,
+    },
+    UpdateFile {
+        path: PathBuf,
+        move_path: Option<PathBuf>,
+        chunks: Vec<Chunk>,
+    },
 }
 
 impl Hunk {
@@ -47,7 +56,9 @@ impl Hunk {
     pub fn classify_path(&self) -> &Path {
         match self {
             Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => path,
-            Hunk::UpdateFile { move_path: Some(p), .. } => p,
+            Hunk::UpdateFile {
+                move_path: Some(p), ..
+            } => p,
             Hunk::UpdateFile { path, .. } => path,
         }
     }
@@ -56,12 +67,30 @@ impl Hunk {
         match self {
             Hunk::AddFile { path, .. } => format!("add {}", path.display()),
             Hunk::DeleteFile { path } => format!("delete {}", path.display()),
-            Hunk::UpdateFile { path, move_path, chunks } => {
+            Hunk::UpdateFile {
+                path,
+                move_path,
+                chunks,
+            } => {
                 let added: usize = chunks.iter().map(|c| c.new_lines.len()).sum();
-                let removed: usize = chunks.iter().map(|c| c.old_lines.len().min(c.new_lines.len())).sum();
+                let removed: usize = chunks
+                    .iter()
+                    .map(|c| c.old_lines.len().min(c.new_lines.len()))
+                    .sum();
                 match move_path {
-                    Some(m) => format!("move {} -> {} (+{} -{} lines)", path.display(), m.display(), added, removed),
-                    None => format!("update {} (+{} -{} lines)", path.display(), added.saturating_sub(removed), removed),
+                    Some(m) => format!(
+                        "move {} -> {} (+{} -{} lines)",
+                        path.display(),
+                        m.display(),
+                        added,
+                        removed
+                    ),
+                    None => format!(
+                        "update {} (+{} -{} lines)",
+                        path.display(),
+                        added.saturating_sub(removed),
+                        removed
+                    ),
                 }
             }
         }
@@ -105,11 +134,16 @@ pub fn parse_patch(raw: &str) -> Result<Vec<Hunk>> {
             if !body.is_empty() {
                 body.push('\n');
             }
-            hunks.push(Hunk::AddFile { path, contents: body });
+            hunks.push(Hunk::AddFile {
+                path,
+                contents: body,
+            });
             continue;
         }
         if let Some(rest) = line.strip_prefix(DELETE_FILE_MARKER) {
-            hunks.push(Hunk::DeleteFile { path: PathBuf::from(rest.trim()) });
+            hunks.push(Hunk::DeleteFile {
+                path: PathBuf::from(rest.trim()),
+            });
             i += 1;
             continue;
         }
@@ -118,7 +152,9 @@ pub fn parse_patch(raw: &str) -> Result<Vec<Hunk>> {
             i += 1;
             let mut move_path = None;
             if i < lines.len() && lines[i].trim_end().starts_with(MOVE_TO_MARKER) {
-                move_path = Some(PathBuf::from(lines[i].trim_end()[MOVE_TO_MARKER.len()..].trim()));
+                move_path = Some(PathBuf::from(
+                    lines[i].trim_end()[MOVE_TO_MARKER.len()..].trim(),
+                ));
                 i += 1;
             }
             let mut chunks: Vec<Chunk> = Vec::new();
@@ -152,7 +188,10 @@ pub fn parse_patch(raw: &str) -> Result<Vec<Hunk>> {
                 }
                 if l == "@@" || l.starts_with("@@ ") {
                     flush(&mut cur, &mut chunks);
-                    cur.change_context = l.strip_prefix("@@ ").map(str::to_string).filter(|s| !s.is_empty());
+                    cur.change_context = l
+                        .strip_prefix("@@ ")
+                        .map(str::to_string)
+                        .filter(|s| !s.is_empty());
                     i += 1;
                     continue;
                 }
@@ -177,7 +216,11 @@ pub fn parse_patch(raw: &str) -> Result<Vec<Hunk>> {
                 i += 1;
             }
             flush(&mut cur, &mut chunks);
-            hunks.push(Hunk::UpdateFile { path, move_path, chunks });
+            hunks.push(Hunk::UpdateFile {
+                path,
+                move_path,
+                chunks,
+            });
             continue;
         }
         bail!("invalid patch: unexpected line {}: '{}'", i + 1, line);
@@ -285,7 +328,12 @@ fn split_lines(contents: &str) -> Vec<String> {
     v
 }
 
-fn apply_update(cwd: &Path, path: &Path, move_path: &Option<PathBuf>, chunks: &[Chunk]) -> Result<String> {
+fn apply_update(
+    cwd: &Path,
+    path: &Path,
+    move_path: &Option<PathBuf>,
+    chunks: &[Chunk],
+) -> Result<String> {
     let abs = cwd.join(path);
     let raw = std::fs::read_to_string(&abs)
         .with_context(|| format!("Failed to read file to update {}", abs.display()))?;
@@ -306,8 +354,7 @@ fn apply_update(cwd: &Path, path: &Path, move_path: &Option<PathBuf>, chunks: &[
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    std::fs::write(&abs, out.as_bytes())
-        .with_context(|| format!("writing {}", abs.display()))?;
+    std::fs::write(&abs, out.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
     if let Some(dest) = move_path {
         let dest_abs = cwd.join(dest);
         if let Some(parent) = dest_abs.parent() {
@@ -357,7 +404,11 @@ pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
                 ));
                 changed.push(hunk.describe());
             }
-            Hunk::UpdateFile { path, move_path, chunks } => {
+            Hunk::UpdateFile {
+                path,
+                move_path,
+                chunks,
+            } => {
                 // Snapshot the pre-image BEFORE mutating for the diff.
                 let old = std::fs::read_to_string(cwd.join(path)).unwrap_or_default();
                 let new_contents = apply_update(cwd, path, move_path, chunks)?;
@@ -373,7 +424,11 @@ pub fn apply_hunks(cwd: &Path, hunks: &[Hunk]) -> Result<AppliedPatch> {
     Ok(AppliedPatch {
         summary: format!(
             "Success. Updated the following files:\n{}",
-            changed.iter().map(|d| format!("M {d}")).collect::<Vec<_>>().join("\n")
+            changed
+                .iter()
+                .map(|d| format!("M {d}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ),
         files,
     })
@@ -415,16 +470,17 @@ mod tests {
             _ => panic!("expected add"),
         }
         match &hunks[1] {
-            Hunk::UpdateFile { path, move_path, chunks } => {
+            Hunk::UpdateFile {
+                path,
+                move_path,
+                chunks,
+            } => {
                 assert_eq!(path, Path::new("src/lib.rs"));
                 assert!(move_path.is_none());
                 // One @@ marker ⇒ one chunk; context lines join old+new.
                 assert_eq!(chunks.len(), 1);
                 assert_eq!(chunks[0].change_context.as_deref(), Some("fn main() {"));
-                assert_eq!(
-                    chunks[0].old_lines,
-                    vec!["old_a", "    kept();", "old_b"]
-                );
+                assert_eq!(chunks[0].old_lines, vec!["old_a", "    kept();", "old_b"]);
                 assert_eq!(
                     chunks[0].new_lines,
                     vec!["new_line", "    kept();", "replacement"]
@@ -432,14 +488,23 @@ mod tests {
             }
             _ => panic!("expected update"),
         }
-        assert_eq!(hunks[2], Hunk::DeleteFile { path: PathBuf::from("obsolete.txt") });
+        assert_eq!(
+            hunks[2],
+            Hunk::DeleteFile {
+                path: PathBuf::from("obsolete.txt")
+            }
+        );
     }
 
     #[test]
     fn applies_multi_chunk_update_with_fuzzy_whitespace() {
         let dir = std::env::temp_dir().join(format!("lc-patch-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/a.rs"), "fn main() {\n    println!(\"hi\");\n}\n\nfn tail() {\n    1\n}\n").unwrap();
+        std::fs::write(
+            dir.join("src/a.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n\nfn tail() {\n    1\n}\n",
+        )
+        .unwrap();
         let p = "*** Begin Patch\n*** Update File: src/a.rs\n@@ fn main() {\n-    println!(\"hi\");\n+    println!(\"patched\");\n*** Update File: src/a.rs\n@@ fn tail() {\n-    1\n+    42\n*** End Patch";
         // Two separate UpdateFile hunks for the same file — supported sequentially.
         let hunks = parse_patch(p).unwrap();
@@ -461,7 +526,10 @@ mod tests {
         let p = "*** Begin Patch\n*** Update File: f.txt\n*** End of File\n+gamma\n*** End Patch";
         let hunks = parse_patch(p).unwrap();
         apply_hunks(&dir, &hunks).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "alpha\nbeta\ngamma\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -474,7 +542,10 @@ mod tests {
         let hunks = parse_patch(p).unwrap();
         apply_hunks(&dir, &hunks).unwrap();
         assert!(!dir.join("f.txt").exists());
-        assert_eq!(std::fs::read_to_string(dir.join("sub/g.txt")).unwrap(), "ONE\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/g.txt")).unwrap(),
+            "ONE\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -483,8 +554,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lc-patch-miss-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f.txt"), "a\nb\n").unwrap();
-        let p = "*** Begin Patch\n*** Update File: f.txt\n@@ nonexistent-anchor\n-b\n+B\n*** End Patch";
-        let err = apply_hunks(&dir, &parse_patch(p).unwrap()).unwrap_err().to_string();
+        let p =
+            "*** Begin Patch\n*** Update File: f.txt\n@@ nonexistent-anchor\n-b\n+B\n*** End Patch";
+        let err = apply_hunks(&dir, &parse_patch(p).unwrap())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("nonexistent-anchor"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }

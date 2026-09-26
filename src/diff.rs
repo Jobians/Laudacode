@@ -75,7 +75,12 @@ pub fn unified_diff(path: &str, old: &str, new: &str, context: usize) -> FileDif
     let mid_b = &b[start..end_b];
 
     if mid_a.is_empty() && mid_b.is_empty() {
-        return FileDiff { path: path.into(), added: 0, removed: 0, lines: vec![] };
+        return FileDiff {
+            path: path.into(),
+            added: 0,
+            removed: 0,
+            lines: vec![],
+        };
     }
 
     let mut ops: Vec<(LineKind, &str)> = Vec::with_capacity(a.len().max(b.len()));
@@ -98,8 +103,14 @@ pub fn unified_diff(path: &str, old: &str, new: &str, context: usize) -> FileDif
     }
 
     let mut out: Vec<DiffLine> = vec![
-        DiffLine { kind: LineKind::Meta, text: format!("--- a/{path}") },
-        DiffLine { kind: LineKind::Meta, text: format!("+++ b/{path}") },
+        DiffLine {
+            kind: LineKind::Meta,
+            text: format!("--- a/{path}"),
+        },
+        DiffLine {
+            kind: LineKind::Meta,
+            text: format!("+++ b/{path}"),
+        },
     ];
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -191,13 +202,26 @@ pub fn unified_diff(path: &str, old: &str, new: &str, context: usize) -> FileDif
     let _ = truncated;
 
     if added == 0 && removed == 0 {
-        return FileDiff { path: path.into(), added: 0, removed: 0, lines: vec![] };
+        return FileDiff {
+            path: path.into(),
+            added: 0,
+            removed: 0,
+            lines: vec![],
+        };
     }
     if out.len() > MAX_DIFF_LINES + 2 {
         out.truncate(MAX_DIFF_LINES + 2);
-        out.push(DiffLine { kind: LineKind::Meta, text: "… [diff truncated]".into() });
+        out.push(DiffLine {
+            kind: LineKind::Meta,
+            text: "… [diff truncated]".into(),
+        });
     }
-    FileDiff { path: path.into(), added, removed, lines: out }
+    FileDiff {
+        path: path.into(),
+        added,
+        removed,
+        lines: out,
+    }
 }
 
 /// Classic LCS backtrace producing ordered Add/Del/Ctx ops.
@@ -257,8 +281,14 @@ mod tests {
         assert!(texts.contains(&"-    two();"));
         assert!(texts.contains(&"+    two_changed();"));
         assert!(texts.contains(&"+    three();"));
-        assert!(texts.contains(&"     one();"), "context preserved: {texts:?}");
-        assert!(d.lines.iter().any(|l| l.kind == LineKind::Meta && l.text.contains("@@")));
+        assert!(
+            texts.contains(&"     one();"),
+            "context preserved: {texts:?}"
+        );
+        assert!(d
+            .lines
+            .iter()
+            .any(|l| l.kind == LineKind::Meta && l.text.contains("@@")));
     }
 
     #[test]
@@ -273,7 +303,10 @@ mod tests {
         let d = unified_diff("new.rs", "", "alpha\nbeta\n", 2);
         assert_eq!(d.added, 2);
         assert_eq!(d.removed, 0);
-        assert!(d.lines.iter().all(|l| l.kind == LineKind::Add || l.kind == LineKind::Meta));
+        assert!(d
+            .lines
+            .iter()
+            .all(|l| l.kind == LineKind::Add || l.kind == LineKind::Meta));
     }
 
     #[test]
@@ -285,7 +318,10 @@ mod tests {
 
     #[test]
     fn far_apart_changes_make_separate_hunks() {
-        let filler = (0..30).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let filler = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let old = format!("{filler}\ntail\n");
         let edited = filler
             .replace("line5", "line5-edited")
@@ -293,19 +329,37 @@ mod tests {
         let new = format!("{edited}\ntail\n");
         let d = unified_diff("big.txt", &old, &new, 3);
         let meta_count = d.lines.iter().filter(|l| l.text.starts_with("@@")).count();
-        assert_eq!(meta_count, 2, "expected two hunks, got {meta_count}: {}", 
-            d.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("|"));
+        assert_eq!(
+            meta_count,
+            2,
+            "expected two hunks, got {meta_count}: {}",
+            d.lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("|")
+        );
         // Unchanged filler lines must NOT appear between distant hunks.
         assert!(!d.lines.iter().any(|l| l.text == " line12"));
     }
 
     #[test]
     fn huge_files_fall_back_to_coarse_diff_without_panic() {
-        let big_a = (0..5000).map(|i| format!("old{i}")).collect::<Vec<_>>().join("\n");
-        let big_b = (0..5000).map(|i| format!("new{i}")).collect::<Vec<_>>().join("\n");
+        let big_a = (0..5000)
+            .map(|i| format!("old{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big_b = (0..5000)
+            .map(|i| format!("new{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let d = unified_diff("huge.txt", &big_a, &big_b, 2);
         assert!(d.removed > 0 && d.added > 0);
-        assert!(d.lines.len() <= MAX_DIFF_LINES + 3, "capped: {}", d.lines.len());
+        assert!(
+            d.lines.len() <= MAX_DIFF_LINES + 3,
+            "capped: {}",
+            d.lines.len()
+        );
         assert!(d.lines.last().unwrap().text.contains("[diff truncated]"));
     }
 
@@ -315,8 +369,12 @@ mod tests {
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["path"], "a");
         // lines: ---/+++/@@ header, then -x, +y
-        let kinds: Vec<&str> = v["lines"].as_array().unwrap()
-            .iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        let kinds: Vec<&str> = v["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["kind"].as_str().unwrap())
+            .collect();
         assert!(kinds.contains(&"del"), "{kinds:?}");
         assert!(kinds.contains(&"add"), "{kinds:?}");
     }

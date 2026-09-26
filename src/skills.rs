@@ -34,8 +34,7 @@ impl Skill {
     /// Frontmatter-derived name is preferred; the directory name is the
     /// fallback.
     pub fn dir_name(path: &Path) -> String {
-        path
-            .parent()
+        path.parent()
             .and_then(Path::file_name)
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default()
@@ -59,7 +58,9 @@ pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 pub fn discover(cwd: &Path) -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
     for dir in skill_dirs(cwd) {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
@@ -67,7 +68,9 @@ pub fn discover(cwd: &Path) -> Vec<Skill> {
             if !path.is_file() {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let (fm, body) = split_frontmatter(&raw);
             let name = fm
                 .get("name")
@@ -86,7 +89,11 @@ pub fn discover(cwd: &Path) -> Vec<Skill> {
                 .to_string();
             // Later directory wins (project overrides global).
             out.retain(|s: &Skill| s.name != name);
-            out.push(Skill { name, description, path });
+            out.push(Skill {
+                name,
+                description,
+                path,
+            });
         }
     }
     out
@@ -130,7 +137,11 @@ fn picker_items_for(skills: &[Skill]) -> Vec<String> {
     skills
         .iter()
         .map(|s| {
-            let desc = if s.description.is_empty() { "(no description)" } else { &s.description };
+            let desc = if s.description.is_empty() {
+                "(no description)"
+            } else {
+                &s.description
+            };
             format!("{} — {}", s.name, desc)
         })
         .collect()
@@ -176,19 +187,25 @@ mod tests {
     #[test]
     fn picker_rows_use_name_and_description() {
         assert!(picker_items_for(&[]).is_empty(), "no skills → empty picker");
-        let skills = vec![Skill {
-            name: "release-notes".into(),
-            description: "Write release notes".into(),
-            path: PathBuf::from("global/skills/release-notes/SKILL.md"),
-        }, Skill {
-            name: "minimal".into(),
-            description: String::new(),
-            path: PathBuf::from("global/skills/minimal/SKILL.md"),
-        }];
+        let skills = vec![
+            Skill {
+                name: "release-notes".into(),
+                description: "Write release notes".into(),
+                path: PathBuf::from("global/skills/release-notes/SKILL.md"),
+            },
+            Skill {
+                name: "minimal".into(),
+                description: String::new(),
+                path: PathBuf::from("global/skills/minimal/SKILL.md"),
+            },
+        ];
         let items = picker_items_for(&skills);
         assert_eq!(
             items,
-            vec!["release-notes — Write release notes", "minimal — (no description)"]
+            vec![
+                "release-notes — Write release notes",
+                "minimal — (no description)"
+            ]
         );
     }
 
@@ -238,11 +255,22 @@ mod tests {
         let sb = Sandbox::new();
         let global = crate::config::Config::dir().join("skills");
         write_skill(&global, "deploy", "ship the app");
-        write_skill(&sb.cwd.join(".laudacode").join("skills"), "deploy", "project deploy variant");
-        write_skill(&sb.cwd.join(".laudacode").join("skills"), "lint", "lint the code");
+        write_skill(
+            &sb.cwd.join(".laudacode").join("skills"),
+            "deploy",
+            "project deploy variant",
+        );
+        write_skill(
+            &sb.cwd.join(".laudacode").join("skills"),
+            "lint",
+            "lint the code",
+        );
 
         let skills = discover(&sb.cwd);
-        let deploy = skills.iter().find(|s| s.name == "deploy").expect("deploy present");
+        let deploy = skills
+            .iter()
+            .find(|s| s.name == "deploy")
+            .expect("deploy present");
         assert_eq!(deploy.description, "project deploy variant", "project wins");
         assert!(skills.iter().any(|s| s.name == "lint"));
         // Paths point at the SKILL.md files.
@@ -261,7 +289,10 @@ mod tests {
         )
         .unwrap();
         let skills = discover(&sb.cwd);
-        let bare = skills.iter().find(|s| s.name == "bare").expect("bare present");
+        let bare = skills
+            .iter()
+            .find(|s| s.name == "bare")
+            .expect("bare present");
         assert_eq!(bare.description, "Commit style guide");
         assert_eq!(Skill::dir_name(&bare.path), "bare");
     }
@@ -269,7 +300,11 @@ mod tests {
     #[test]
     fn prompt_block_lists_skills_with_paths() {
         let sb = Sandbox::new();
-        write_skill(&sb.cwd.join(".laudacode").join("skills"), "pdf", "generate pdfs");
+        write_skill(
+            &sb.cwd.join(".laudacode").join("skills"),
+            "pdf",
+            "generate pdfs",
+        );
         let skills = discover(&sb.cwd);
         let block = prompt_block(&skills);
         assert!(block.contains("pdf"));

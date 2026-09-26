@@ -31,7 +31,14 @@ pub static TEAM: &[AgentSpec] = &[
         prompt: "You are the PLANNER. Produce a concise, ordered implementation plan: \
                  exact files to touch, functions to add/change, risks, and a test strategy. \
                  Do NOT write full implementations.",
-        allowed: &["list_dir", "read_file", "grep", "glob", "fetch_url", "web_search"],
+        allowed: &[
+            "list_dir",
+            "read_file",
+            "grep",
+            "glob",
+            "fetch_url",
+            "web_search",
+        ],
         read_only: true,
     },
     AgentSpec {
@@ -40,7 +47,14 @@ pub static TEAM: &[AgentSpec] = &[
         prompt: "You are the RESEARCHER. Answer the question with precise references \
                  (file:line) or fetched documentation excerpts. Be exhaustive about \
                  relevant facts, brief about everything else.",
-        allowed: &["list_dir", "read_file", "grep", "glob", "fetch_url", "web_search"],
+        allowed: &[
+            "list_dir",
+            "read_file",
+            "grep",
+            "glob",
+            "fetch_url",
+            "web_search",
+        ],
         read_only: true,
     },
     AgentSpec {
@@ -49,7 +63,15 @@ pub static TEAM: &[AgentSpec] = &[
         prompt: "You are the CODER. Implement exactly the assigned change. Inspect before \
                  editing, keep diffs minimal, follow existing style, and verify imports. \
                  Summarize what you changed in bullets.",
-        allowed: &["list_dir", "read_file", "grep", "glob", "apply_patch", "edit_file", "write_file"],
+        allowed: &[
+            "list_dir",
+            "read_file",
+            "grep",
+            "glob",
+            "apply_patch",
+            "edit_file",
+            "write_file",
+        ],
         read_only: false,
     },
     AgentSpec {
@@ -120,13 +142,19 @@ pub fn install_custom(agents: &std::collections::BTreeMap<String, crate::config:
         let allowed: Vec<String> = if cfg.tools.is_empty() {
             // Sensible default for user roles: read-only exploration.
             ["list_dir", "read_file", "grep", "glob"]
-                .iter().map(|s| s.to_string()).collect()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         } else {
             cfg.tools.clone()
         };
         list.push(Role {
             name: sanitized,
-            description: if cfg.description.is_empty() { "custom agent".into() } else { cfg.description.clone() },
+            description: if cfg.description.is_empty() {
+                "custom agent".into()
+            } else {
+                cfg.description.clone()
+            },
             prompt: cfg.prompt.clone(),
             allowed,
             read_only: cfg.read_only || cfg.tools.is_empty(),
@@ -137,7 +165,12 @@ pub fn install_custom(agents: &std::collections::BTreeMap<String, crate::config:
 pub fn all_roles() -> Vec<Role> {
     let mut out: Vec<Role> = TEAM.iter().map(Role::from_spec).collect();
     if let Some(lock) = CUSTOM_ROLES.get() {
-        out.extend(lock.read().unwrap_or_else(|p| p.into_inner()).iter().cloned());
+        out.extend(
+            lock.read()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .cloned(),
+        );
     }
     out
 }
@@ -160,8 +193,10 @@ pub fn describe_team() -> String {
             if r.read_only { "  (read-only)" } else { "" }
         ));
     }
-    out.push_str("\nThe orchestrator decides when to delegate; ask it to \"plan X\", \
-                  \"have reviewer check Y\", or \"research Z in parallel\".");
+    out.push_str(
+        "\nThe orchestrator decides when to delegate; ask it to \"plan X\", \
+                  \"have reviewer check Y\", or \"research Z in parallel\".",
+    );
     out
 }
 
@@ -230,10 +265,7 @@ struct DelegateArgs {
 pub fn parse_delegate_args(arguments: &str) -> anyhow::Result<Vec<(String, String)>> {
     let parsed: DelegateArgs = serde_json::from_str(arguments)
         .map_err(|e| anyhow::anyhow!("invalid delegate arguments: {e}"))?;
-    anyhow::ensure!(
-        !parsed.tasks.is_empty(),
-        "delegate needs at least one task"
-    );
+    anyhow::ensure!(!parsed.tasks.is_empty(), "delegate needs at least one task");
     anyhow::ensure!(
         parsed.tasks.len() <= 4,
         "at most 4 concurrent delegates supported"
@@ -241,15 +273,13 @@ pub fn parse_delegate_args(arguments: &str) -> anyhow::Result<Vec<(String, Strin
     let known: Vec<String> = all_roles().into_iter().map(|r| r.name).collect();
     let mut out = Vec::with_capacity(parsed.tasks.len());
     for t in parsed.tasks {
-        let spec = find_role(&t.agent)
-            .map(|r| r.name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown agent '{}' — available: {}",
-                    t.agent,
-                    known.join(", ")
-                )
-            })?;
+        let spec = find_role(&t.agent).map(|r| r.name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown agent '{}' — available: {}",
+                t.agent,
+                known.join(", ")
+            )
+        })?;
         anyhow::ensure!(!t.task.trim().is_empty(), "empty task for '{spec}'");
         out.push((spec, t.task));
     }
@@ -323,11 +353,18 @@ async fn run_loop(
     let tools = toolset_for(spec);
     for _round in 0..MAX_SUB_ROUNDS {
         let turn = client
-            .stream_chat(model, &messages, &tools, |ev| match ev {
-                StreamEvent::Content(s) => ui.on_event(AgentEvent::Content(s)),
-                StreamEvent::Reasoning(s) => ui.on_event(AgentEvent::Reasoning(s)),
-                StreamEvent::Usage(u) => ui.on_event(AgentEvent::Usage(u)),
-            }, None)
+            .stream_chat(
+                model,
+                &messages,
+                &tools,
+                |ev| match ev {
+                    StreamEvent::Content(s) => ui.on_event(AgentEvent::Content(s)),
+                    StreamEvent::Reasoning(s) => ui.on_event(AgentEvent::Reasoning(s)),
+                    StreamEvent::Usage(u) => ui.on_event(AgentEvent::Usage(u)),
+                    StreamEvent::Notice(s) => ui.on_event(AgentEvent::Notice(s)),
+                },
+                None,
+            )
             .await?;
         if turn.tool_calls.is_empty() {
             if turn.content.trim().is_empty() {
@@ -337,7 +374,11 @@ async fn run_loop(
         }
         messages.push(crate::api::Message::assistant_with_tools(
             turn.tool_calls.clone(),
-            if turn.content.is_empty() { None } else { Some(turn.content) },
+            if turn.content.is_empty() {
+                None
+            } else {
+                Some(turn.content)
+            },
         ));
         for tc in turn.tool_calls {
             // tool_name() strips provider namespaces (Gemini `default_api:`).
@@ -350,11 +391,8 @@ async fn run_loop(
                 ));
                 continue;
             }
-            let action = crate::tools::parse_tool_action(
-                &tool_name,
-                &tc.function.arguments,
-            )
-            .map_err(|e| e.context("parsing sub-agent tool call"))?;
+            let action = crate::tools::parse_tool_action(&tool_name, &tc.function.arguments)
+                .map_err(|e| e.context("parsing sub-agent tool call"))?;
             ui.on_event(AgentEvent::ToolStart {
                 name: format!("{}/{tool_name}", spec.name),
                 summary: action.describe(),
@@ -364,9 +402,7 @@ async fn run_loop(
             // prompts (writes outside the workspace, dangerous commands).
             let approved = match action.danger(cwd) {
                 crate::tools::Danger::Safe => true,
-                crate::tools::Danger::Moderate => {
-                    !spec.read_only && mode != ApprovalMode::Suggest
-                }
+                crate::tools::Danger::Moderate => !spec.read_only && mode != ApprovalMode::Suggest,
                 crate::tools::Danger::High => ui.approve(&action, crate::tools::Danger::High),
             };
             let result = if !approved {
@@ -387,7 +423,9 @@ async fn run_loop(
             };
             ui.on_event(AgentEvent::ToolDone {
                 name: format!("{}/{tool_name}", spec.name),
-                ok: !result.starts_with("Command failed") && !result.contains("DECLINED") && !result.starts_with("blocked"),
+                ok: !result.starts_with("Command failed")
+                    && !result.contains("DECLINED")
+                    && !result.starts_with("blocked"),
                 preview: result.chars().take(160).collect(),
             });
             messages.push(Message::tool_result(&tc.id, result));
@@ -405,8 +443,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for s in TEAM {
             assert!(seen.insert(s.name), "duplicate spec {}", s.name);
-            let known: Vec<&str> =
-                crate::tools::tool_defs().iter().map(|t| t.function.name).collect();
+            let known: Vec<&str> = crate::tools::tool_defs()
+                .iter()
+                .map(|t| t.function.name)
+                .collect();
             for a in s.allowed {
                 assert!(known.contains(a), "{} allows unknown tool {}", s.name, a);
             }
@@ -422,7 +462,10 @@ mod tests {
         assert_eq!(ok.len(), 2);
         assert_eq!(ok[0].0, "researcher");
 
-        assert!(get("RESEARCHER").is_some(), "name lookup is case-insensitive");
+        assert!(
+            get("RESEARCHER").is_some(),
+            "name lookup is case-insensitive"
+        );
         assert!(get("nope").is_none());
 
         let err = parse_delegate_args(r#"{"tasks":[{"agent":"ghost","task":"x"}]}"#)
@@ -445,18 +488,24 @@ mod tests {
         let set = toolset_for(&coder);
         let names: Vec<&str> = set.iter().map(|t| t.function.name).collect();
         assert!(names.contains(&"apply_patch"));
-        assert!(!names.contains(&"run_command"), "coder must not run commands");
+        assert!(
+            !names.contains(&"run_command"),
+            "coder must not run commands"
+        );
 
         let reviewer = find_role("reviewer").unwrap();
-        let names: Vec<&str> =
-            toolset_for(&reviewer).iter().map(|t| t.function.name).collect();
+        let names: Vec<&str> = toolset_for(&reviewer)
+            .iter()
+            .map(|t| t.function.name)
+            .collect();
         assert!(names.contains(&"grep"));
         assert!(!names.contains(&"write_file"), "reviewer is read-only");
 
         // Plan-mode schema hides mutating specialists from the enum.
         let def = delegate_tool_def(true);
         let raw = serde_json::to_value(&def).unwrap();
-        let enums = raw["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]["agent"]["enum"]
+        let enums = raw["function"]["parameters"]["properties"]["tasks"]["items"]["properties"]
+            ["agent"]["enum"]
             .as_array()
             .unwrap();
         assert!(!enums.iter().any(|v| v == "coder"), "{enums:?}");
