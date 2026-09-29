@@ -8,6 +8,7 @@
 use crate::api::{FunctionDef, ToolDef};
 use serde::Deserialize;
 use serde_json::json;
+use std::borrow::Cow;
 
 /// Definition of one specialist the orchestrator can spawn.
 #[derive(Debug, Clone, Copy)]
@@ -182,24 +183,6 @@ pub fn find_role(name: &str) -> Option<Role> {
         .find(|r| r.name.eq_ignore_ascii_case(name))
 }
 
-/// `/agents` listing for the TUI.
-pub fn describe_team() -> String {
-    let mut out = String::from("Specialist agents available via the delegate tool:\n");
-    for r in all_roles() {
-        out.push_str(&format!(
-            "  {:<11} {}{}\n",
-            r.name,
-            r.description,
-            if r.read_only { "  (read-only)" } else { "" }
-        ));
-    }
-    out.push_str(
-        "\nThe orchestrator decides when to delegate; ask it to \"plan X\", \
-                  \"have reviewer check Y\", or \"research Z in parallel\".",
-    );
-    out
-}
-
 // ---------------------------------------------------------------------------
 // delegate tool schema + argument parsing
 // ---------------------------------------------------------------------------
@@ -216,11 +199,13 @@ pub fn delegate_tool_def(plan_mode: bool) -> ToolDef {
     ToolDef {
         r#type: "function",
         function: FunctionDef {
-            name: "delegate",
-            description: "Delegate work to specialist sub-agent(s). Each runs in its own \
+            name: Cow::Borrowed("delegate"),
+            description: Cow::Borrowed(
+                "Delegate work to specialist sub-agent(s). Each runs in its own \
                           context with a restricted toolset and reports back. Use for \
                           independent research/planning/coding/testing chunks — up to 4 at \
                           once. Their final reports arrive as your tool result.",
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -290,7 +275,7 @@ pub fn parse_delegate_args(arguments: &str) -> anyhow::Result<Vec<(String, Strin
 pub fn toolset_for(spec: &Role) -> Vec<ToolDef> {
     crate::tools::tool_defs()
         .into_iter()
-        .filter(|t| spec.allowed.iter().any(|a| a == t.function.name))
+        .filter(|t| spec.allowed.iter().any(|a| a == t.function.name.as_ref()))
         .collect()
 }
 
@@ -317,6 +302,16 @@ fn sub_system_prompt(cwd: &std::path::Path, spec: &Role) -> String {
     )
 }
 
+/// One specialist's report plus the tokens it burned, so the orchestrator can
+/// charge the delegation against `[limits]` instead of treating it as free.
+#[derive(Debug, Default, Clone)]
+pub struct SubAgentResult {
+    pub report: String,
+    /// (prompt, completion) tokens, including the round that failed — a
+    /// sub-agent that errors out still cost money.
+    pub usage: (u64, u64),
+}
+
 /// Run one specialist to completion. Events stream through `ui` (already
 /// prefixed by the caller's fork) so the main transcript shows sub-activity.
 pub async fn run_sub_agent(
@@ -327,20 +322,31 @@ pub async fn run_sub_agent(
     spec_name: &str,
     task: &str,
     mut ui: Box<dyn UiSink>,
-) -> String {
+) -> SubAgentResult {
     let Some(spec) = find_role(spec_name) else {
-        return format!("error: unknown agent '{spec_name}'");
+        return SubAgentResult {
+            report: format!("error: unknown agent '{spec_name}'"),
+            usage: (0, 0),
+        };
     };
     let messages = vec![
         Message::system(sub_system_prompt(cwd, &spec)),
         Message::user(task.to_string()),
     ];
-    match run_loop(client, model, cwd, mode, &spec, messages, &mut ui).await {
+    // Accumulated across rounds; owned here so it survives an `Err` return.
+    let mut usage = (0u64, 0u64);
+    let report = match run_loop(
+        client, model, cwd, mode, &spec, messages, &mut ui, &mut usage,
+    )
+    .await
+    {
         Ok(report) => report,
         Err(e) => format!("[{spec_name} failed] {e:#}"),
-    }
+    };
+    SubAgentResult { report, usage }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     client: &ChatClient,
     model: &str,
@@ -349,6 +355,7 @@ async fn run_loop(
     spec: &Role,
     mut messages: Vec<Message>,
     ui: &mut Box<dyn UiSink>,
+    usage: &mut (u64, u64),
 ) -> anyhow::Result<String> {
     let tools = toolset_for(spec);
     for _round in 0..MAX_SUB_ROUNDS {
@@ -366,6 +373,10 @@ async fn run_loop(
                 None,
             )
             .await?;
+        if let Some(u) = turn.usage {
+            usage.0 = usage.0.saturating_add(u.billable_prompt());
+            usage.1 = usage.1.saturating_add(u.completion_tokens);
+        }
         if turn.tool_calls.is_empty() {
             if turn.content.trim().is_empty() {
                 anyhow::bail!("empty reply");
@@ -443,12 +454,17 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for s in TEAM {
             assert!(seen.insert(s.name), "duplicate spec {}", s.name);
-            let known: Vec<&str> = crate::tools::tool_defs()
+            let known: Vec<String> = crate::tools::tool_defs()
                 .iter()
-                .map(|t| t.function.name)
+                .map(|t| t.function.name.to_string())
                 .collect();
             for a in s.allowed {
-                assert!(known.contains(a), "{} allows unknown tool {}", s.name, a);
+                assert!(
+                    known.iter().any(|k| k == a),
+                    "{} allows unknown tool {}",
+                    s.name,
+                    a
+                );
             }
         }
     }
@@ -486,20 +502,23 @@ mod tests {
     fn toolsets_are_scoped_to_role() {
         let coder = find_role("coder").unwrap();
         let set = toolset_for(&coder);
-        let names: Vec<&str> = set.iter().map(|t| t.function.name).collect();
-        assert!(names.contains(&"apply_patch"));
+        let names: Vec<String> = set.iter().map(|t| t.function.name.to_string()).collect();
+        assert!(names.iter().any(|n| n == "apply_patch"));
         assert!(
-            !names.contains(&"run_command"),
+            !names.iter().any(|n| n == "run_command"),
             "coder must not run commands"
         );
 
         let reviewer = find_role("reviewer").unwrap();
-        let names: Vec<&str> = toolset_for(&reviewer)
+        let names: Vec<String> = toolset_for(&reviewer)
             .iter()
-            .map(|t| t.function.name)
+            .map(|t| t.function.name.to_string())
             .collect();
-        assert!(names.contains(&"grep"));
-        assert!(!names.contains(&"write_file"), "reviewer is read-only");
+        assert!(names.iter().any(|n| n == "grep"));
+        assert!(
+            !names.iter().any(|n| n == "write_file"),
+            "reviewer is read-only"
+        );
 
         // Plan-mode schema hides mutating specialists from the enum.
         let def = delegate_tool_def(true);

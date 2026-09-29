@@ -100,6 +100,34 @@ pub struct Limits {
     pub max_retries: Option<u32>,
 }
 
+/// USD per 1M tokens for one model. `[pricing]` overrides the built-in table
+/// in `budget.rs`, keyed by full model name or any substring of it.
+///
+/// ```toml
+/// [pricing."anthropic/claude-sonnet-4"]
+/// input = 3.0
+/// output = 15.0
+/// ```
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ModelPrice {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+}
+
+/// Per-model price overrides. Transparent so it reads as `[pricing.<key>]`
+/// in TOML rather than an extra layer of nesting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Pricing(pub BTreeMap<String, ModelPrice>);
+
+impl Pricing {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Structured (JSONL) run log (`[logging]`). Off unless a file is configured.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Logging {
@@ -177,6 +205,15 @@ pub struct Config {
     /// Session guardrails (`[limits]`).
     #[serde(default, skip_serializing_if = "is_default_limits")]
     pub limits: Limits,
+    /// Per-model price overrides in USD per 1M tokens (`[pricing]`).
+    #[serde(default, skip_serializing_if = "Pricing::is_empty")]
+    pub pricing: Pricing,
+    /// External tool servers (`[mcp_servers.<name>]`), stdio transport only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp_servers: BTreeMap<String, crate::mcp::ServerSpec>,
+    /// Language servers (`[lsp_servers.<name>]`), stdio transport only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lsp_servers: BTreeMap<String, crate::lsp::LspSpec>,
     /// Structured run log (`[logging]`).
     #[serde(default, skip_serializing_if = "is_default_logging")]
     pub logging: Logging,
@@ -189,7 +226,10 @@ fn is_default_hooks(h: &Hooks) -> bool {
     h.post_edit.is_empty() && h.post_edit_timeout_secs == default_hook_timeout()
 }
 fn is_default_limits(l: &Limits) -> bool {
-    l.max_cost_usd.is_none() && l.max_tokens.is_none()
+    // max_retries must be here too: omitting it made a config that set only
+    // max_retries look "default", so the whole [limits] table was dropped
+    // on save and the setting was silently lost.
+    l.max_cost_usd.is_none() && l.max_tokens.is_none() && l.max_retries.is_none()
 }
 fn is_default_logging(l: &Logging) -> bool {
     !l.enabled && l.file.is_none() && !l.stderr
@@ -519,6 +559,182 @@ mod tests {
         assert!(sanitize_name("has space").is_err());
         assert!(sanitize_name("slash/evil").is_err());
         assert!(sanitize_name("../escape").is_err());
+    }
+
+    #[test]
+    fn limits_max_retries_survives_a_save() {
+        // Regression: `is_default_limits` ignored `max_retries`, so a config
+        // that set *only* max_retries looked untouched and the whole [limits]
+        // table was skipped on save — the setting was silently lost.
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("lc-limits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LAUDACODE_CONFIG_DIR", &dir);
+
+        let mut cfg = Config::default();
+        cfg.limits.max_retries = Some(9);
+        cfg.save().unwrap();
+
+        let raw = std::fs::read_to_string(Config::toml_path()).unwrap();
+        assert!(
+            raw.contains("max_retries"),
+            "[limits] was dropped on save; file was:\n{raw}"
+        );
+        assert_eq!(Config::load().unwrap().limits.max_retries, Some(9));
+
+        // Same shape of bug: a non-default hook timeout must not vanish either.
+        cfg.limits.max_retries = None;
+        cfg.hooks.post_edit_timeout_secs = 42;
+        cfg.save().unwrap();
+        let raw = std::fs::read_to_string(Config::toml_path()).unwrap();
+        assert!(
+            raw.contains("post_edit_timeout_secs"),
+            "hooks dropped:\n{raw}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("LAUDACODE_CONFIG_DIR");
+    }
+
+    #[test]
+    fn mcp_servers_survive_a_save() {
+        // `save` rewrites the whole file from the struct, so any section not
+        // represented in `Config` is silently deleted. Same class of bug as
+        // the `[limits]` regression above.
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("lc-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LAUDACODE_CONFIG_DIR", &dir);
+
+        let mut cfg = Config::default();
+        cfg.mcp_servers.insert(
+            "files".to_string(),
+            crate::mcp::ServerSpec {
+                command: "mcp-server-filesystem".into(),
+                args: vec!["--root".into(), ".".into()],
+                plan: true,
+                timeout_secs: 30,
+                ..Default::default()
+            },
+        );
+        cfg.save().unwrap();
+
+        let back = Config::load().unwrap();
+        let s = back
+            .mcp_servers
+            .get("files")
+            .expect("mcp_servers dropped on save");
+        assert_eq!(s.command, "mcp-server-filesystem");
+        assert_eq!(s.args, vec!["--root", "."]);
+        assert!(s.plan, "plan opt-in lost");
+        assert_eq!(s.timeout_secs, 30);
+        // `enabled` defaults to true, and a round-trip must not flip it.
+        assert!(
+            s.enabled,
+            "an explicit-but-defaulted server came back disabled"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("LAUDACODE_CONFIG_DIR");
+    }
+
+    #[test]
+    fn lsp_servers_survive_a_save() {
+        // Same reason as the mcp case above: `save` is a full rewrite, so a
+        // missing `Config` field means the whole section is silently deleted
+        // on the next `/theme` or provider change.
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("lc-lsp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LAUDACODE_CONFIG_DIR", &dir);
+
+        let mut cfg = Config::default();
+        cfg.lsp_servers.insert(
+            "rust".to_string(),
+            crate::lsp::LspSpec {
+                command: "rust-analyzer".into(),
+                filetypes: std::collections::BTreeMap::from([("rs".into(), "rust".into())]),
+                args: vec!["--stdio".into()],
+                timeout_secs: 20,
+                diagnostics_secs: 5,
+                ..Default::default()
+            },
+        );
+        cfg.save().unwrap();
+
+        let back = Config::load().unwrap();
+        let s = back
+            .lsp_servers
+            .get("rust")
+            .expect("lsp_servers dropped on save");
+        assert_eq!(s.command, "rust-analyzer");
+        assert_eq!(s.filetypes.get("rs").map(String::as_str), Some("rust"));
+        assert_eq!(s.args, vec!["--stdio"]);
+        assert_eq!(s.timeout_secs, 20);
+        assert_eq!(s.diagnostics_secs, 5);
+        assert!(
+            s.enabled,
+            "an explicit-but-defaulted server came back disabled"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("LAUDACODE_CONFIG_DIR");
+    }
+
+    #[test]
+    fn a_picked_model_is_remembered_across_saves() {
+        // The provider switch was already persisted, so a model picked in the
+        // TUI had to be persisted too — otherwise the app reopened on the
+        // provider's old default and quietly ignored the choice.
+        let _g = env_lock();
+        let dir = std::env::temp_dir().join(format!("lc-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LAUDACODE_CONFIG_DIR", &dir);
+
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "p".into(),
+            Provider {
+                base_url: "https://example/v1".into(),
+                api_key: "k".into(),
+                model: "old-default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.active_provider = Some("p".into());
+
+        // What SetModel does: write the pick onto the stored provider, save.
+        cfg.providers.get_mut("p").unwrap().model = "picked-model".into();
+        cfg.save().unwrap();
+
+        // A fresh load must come back on the pick, not the old default.
+        let back = Config::load().unwrap();
+        assert_eq!(back.active_provider.as_deref(), Some("p"));
+        let a = back.resolve_active(None, None, None, None).unwrap();
+        assert_eq!(
+            a.model, "picked-model",
+            "the picked model was not remembered"
+        );
+
+        // Precedence is unchanged: an explicit env or CLI value still wins,
+        // because the pick is a config-file-level default.
+        std::env::set_var("OPENAI_MODEL", "env-model");
+        let a = back.resolve_active(None, None, None, None).unwrap();
+        assert_eq!(
+            a.model, "env-model",
+            "env must still beat the remembered pick"
+        );
+        let a = back
+            .resolve_active(None, None, None, Some("cli-model"))
+            .unwrap();
+        assert_eq!(
+            a.model, "cli-model",
+            "CLI must still beat the remembered pick"
+        );
+        std::env::remove_var("OPENAI_MODEL");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("LAUDACODE_CONFIG_DIR");
     }
 
     #[test]

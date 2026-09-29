@@ -8,7 +8,9 @@ mod diff;
 mod effects;
 mod images;
 mod logging;
+mod lsp;
 mod markdown;
+mod mcp;
 mod patch;
 mod permissions;
 mod processes;
@@ -161,6 +163,7 @@ fn build_app(cli: &Cli) -> Result<App> {
         ov.mode,
     )?;
     app.ui.json_out = cli.json;
+    app.ui.quiet = cli.quiet;
     // Interactive runs with -i pre-queue the attachments for the first prompt.
     if !cli.image.is_empty() && cli.prompt.is_empty() {
         app.pending_images = load_images(cli)?;

@@ -246,8 +246,10 @@ pub struct ToolDef {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    /// `Cow` because built-in tools are `&'static` and MCP servers contribute
+    /// names and descriptions that are only known at runtime.
+    pub name: std::borrow::Cow<'static, str>,
+    pub description: std::borrow::Cow<'static, str>,
     pub parameters: serde_json::Value,
 }
 
@@ -263,11 +265,44 @@ pub enum StreamEvent {
 }
 
 /// Token usage reported by the API (when available).
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+///
+/// Every field is `#[serde(default)]`. This is deserialized straight off a
+/// streaming chunk (`Chunk::usage`), so a provider that omits a single key
+/// used to fail the entire chunk parse — and with it the turn's content,
+/// which is exactly the kind of silent, provider-specific breakage that is
+/// miserable to debug from a bug report.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default)]
     pub prompt_tokens: u64,
+    #[serde(default)]
     pub completion_tokens: u64,
+    #[serde(default)]
     pub total_tokens: u64,
+    /// Prompt tokens served from a provider-side cache (Anthropic reports
+    /// this flat as `cache_read_input_tokens`).
+    #[serde(default, alias = "cache_read_input_tokens")]
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written into the cache (Anthropic only).
+    #[serde(default, alias = "cache_creation_input_tokens")]
+    pub cache_write_tokens: Option<u64>,
+    /// Thinking/reasoning tokens. A *subset* of `completion_tokens` on OpenAI.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Prompt tokens actually billed at the full input rate.
+    ///
+    /// Anthropic reports `prompt_tokens` *excluding* cache hits and cache
+    /// writes, so those two are added back here; OpenAI-style providers
+    /// already include cached tokens in `prompt_tokens` and report no
+    /// separate write count, so adding a zero changes nothing.
+    pub fn billable_prompt(&self) -> u64 {
+        self.prompt_tokens
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.cache_write_tokens.unwrap_or(0))
+    }
 }
 
 /// Fully assembled turn returned after the stream ends.
@@ -1764,6 +1799,48 @@ mod tests {
             body.len(),
             body
         )
+    }
+
+    #[test]
+    fn usage_tolerates_missing_fields() {
+        // A provider that omits `completion_tokens` used to fail the whole
+        // chunk parse, taking the turn's content down with it.
+        let u: Usage = serde_json::from_str(r#"{"prompt_tokens": 7}"#).unwrap();
+        assert_eq!(u.prompt_tokens, 7);
+        assert_eq!(u.completion_tokens, 0);
+        assert_eq!(u.total_tokens, 0);
+        // An empty object is still valid usage, not a parse error.
+        let u: Usage = serde_json::from_str("{}").unwrap();
+        assert_eq!((u.prompt_tokens, u.completion_tokens), (0, 0));
+        // A provider reporting only totals must not break either.
+        let u: Usage = serde_json::from_str(r#"{"total_tokens": 99}"#).unwrap();
+        assert_eq!(u.total_tokens, 99);
+    }
+
+    #[test]
+    fn usage_reads_anthropic_cache_fields() {
+        let u: Usage = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":4,
+                "cache_read_input_tokens":900,"cache_creation_input_tokens":100}"#,
+        )
+        .unwrap();
+        assert_eq!(u.cache_read_tokens, Some(900));
+        assert_eq!(u.cache_write_tokens, Some(100));
+        // Anthropic's prompt_tokens excludes both, so billing adds them back.
+        assert_eq!(u.billable_prompt(), 10 + 900 + 100);
+    }
+
+    #[test]
+    fn billable_prompt_is_a_noop_without_cache_fields() {
+        // OpenAI-style providers already fold cached tokens into
+        // prompt_tokens and report no write count — nothing to add back.
+        let u = Usage {
+            prompt_tokens: 500,
+            completion_tokens: 10,
+            total_tokens: 510,
+            ..Default::default()
+        };
+        assert_eq!(u.billable_prompt(), 500);
     }
 
     fn throttled(retry_after: &str) -> String {

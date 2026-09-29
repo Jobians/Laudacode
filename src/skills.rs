@@ -114,7 +114,7 @@ pub fn prompt_block(skills: &[Skill]) -> String {
         let desc = if sk.description.is_empty() {
             String::from("(no description)")
         } else {
-            sk.description.chars().take(160).collect()
+            clip(&sk.description, 160)
         };
         s.push_str(&format!(
             "- {} — {} (read {} for full instructions)\n",
@@ -140,14 +140,27 @@ fn picker_items_for(skills: &[Skill]) -> Vec<String> {
             let desc = if s.description.is_empty() {
                 "(no description)"
             } else {
-                &s.description
+                &clip(&s.description, 90)
             };
             format!("{} — {}", s.name, desc)
         })
         .collect()
 }
 
-/// Parse simple `key: value` frontmatter (no nesting, no quotes needed).
+/// Parse `key: value` frontmatter.
+///
+/// Real skill files write long descriptions as a YAML block scalar:
+///
+/// ```md
+/// description: >
+///   Prose that wraps across
+///   several lines.
+/// ```
+///
+/// A line-by-line read takes the description to be the lone `>` and throws the
+/// prose away, so every such skill shows up in the picker as ">". Folded (`>`,
+/// spaces) and literal (`|`, newlines) scalars are both handled, with the
+/// `-`/`+` chomping indicators tolerated.
 fn split_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, String>, String) {
     let mut map = std::collections::BTreeMap::new();
     let trimmed = raw.trim_start();
@@ -157,16 +170,69 @@ fn split_frontmatter(raw: &str) -> (std::collections::BTreeMap<String, String>, 
     let Some((fm_raw, body)) = rest.split_once("---") else {
         return (map, raw.to_string());
     };
-    for line in fm_raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    let lines: Vec<&str> = fm_raw.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        i += 1;
+        if line.trim().is_empty() {
             continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            map.insert(k.trim().to_lowercase(), v.trim().to_string());
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_lowercase();
+        let val = v.trim();
+        // `key: >` / `key: >-` / `key: |+` → the value is the indented block
+        // that follows, not the marker.
+        let folded = val.starts_with('>');
+        if !(folded || val.starts_with('|')) {
+            map.insert(key, val.to_string());
+            continue;
+        }
+        // Continuation lines are blank or indented past the key's own column.
+        let indent = line.len() - line.trim_start().len();
+        let mut block: Vec<String> = Vec::new();
+        while i < lines.len() {
+            let nxt = lines[i];
+            if !nxt.trim().is_empty() && nxt.len() - nxt.trim_start().len() <= indent {
+                break; // dedented: a new key
+            }
+            block.push(nxt.trim().to_string());
+            i += 1;
+        }
+        while block.last().is_some_and(|l| l.is_empty()) {
+            block.pop(); // trailing blank lines are not content
+        }
+        let joined = if folded {
+            block.join(" ")
+        } else {
+            block.join("\n")
+        };
+        // A marker with no block body is a mistake, not an empty description:
+        // fall back to the marker-free body line rather than showing ">" .
+        if joined.is_empty() {
+            map.insert(key, val.to_string());
+        } else {
+            map.insert(key, joined);
         }
     }
     (map, body.trim_start().to_string())
+}
+
+/// Clip `s` to `max` characters on a word boundary, marking the cut with an
+/// ellipsis so a truncated description never reads as a complete one.
+fn clip(s: &str, max: usize) -> String {
+    let t = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() <= max {
+        return t;
+    }
+    let mut out: String = t.chars().take(max).collect();
+    if let Some(cut) = out.rfind(' ') {
+        out.truncate(cut);
+    }
+    out.push('…');
+    out
 }
 
 /// First non-empty markdown line, stripped of heading marks.
@@ -295,6 +361,54 @@ mod tests {
             .expect("bare present");
         assert_eq!(bare.description, "Commit style guide");
         assert_eq!(Skill::dir_name(&bare.path), "bare");
+    }
+
+    /// The `description: >` folded scalar used by real skill files (the
+    /// opencode format). A line-by-line read yields ">" as the description
+    /// and silently discards the prose — the picker then shows every skill
+    /// as ">".
+    #[test]
+    fn folded_block_scalar_descriptions_are_joined() {
+        let raw = "---\nname: ponytail-help\ndescription: >\n  Quick-reference card for all modes.\n  One-shot display, not a persistent mode.\n---\n\n# Ponytail\n";
+        let (fm, body) = split_frontmatter(raw);
+        assert_eq!(fm.get("name").unwrap(), "ponytail-help");
+        assert_eq!(
+            fm.get("description").unwrap(),
+            "Quick-reference card for all modes. One-shot display, not a persistent mode."
+        );
+        assert!(body.starts_with("# Ponytail"), "body was {body:?}");
+    }
+
+    /// A literal `|` scalar keeps its newlines, and a single-line value
+    /// after it must not be swallowed into the description.
+    #[test]
+    fn literal_block_scalars_keep_line_breaks() {
+        let raw = "---\nname: x\ndescription: |\n  line one\n  line two\nother: kept\n---\nbody\n";
+        let (fm, _body) = split_frontmatter(raw);
+        assert_eq!(fm.get("description").unwrap(), "line one\nline two");
+        // A sibling key after the block is not swallowed.
+        assert_eq!(fm.get("other").unwrap(), "kept");
+    }
+
+    /// Long real descriptions must not eat the whole picker row.
+    #[test]
+    fn long_descriptions_are_clipped_for_the_picker_and_the_prompt() {
+        let long = "word ".repeat(200);
+        let skills = vec![Skill {
+            name: "verbose".into(),
+            description: long.clone(),
+            path: PathBuf::from("x/SKILL.md"),
+        }];
+        let row = &picker_items_for(&skills)[0];
+        assert!(
+            row.chars().count() < 200,
+            "picker row not clipped: {}",
+            row.chars().count()
+        );
+        let block = prompt_block(&skills);
+        assert!(block.chars().count() < 400, "prompt block not clipped");
+        // The clip must not end mid-word with no hint that it was cut.
+        assert!(!row.contains("wor "), "row should not end mid-word");
     }
 
     #[test]

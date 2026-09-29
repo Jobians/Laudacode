@@ -44,6 +44,17 @@ pub struct Session {
     /// Checkpoint this session was branched from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branched_from: Option<String>,
+    /// Cumulative billable prompt tokens for the session, so `[limits]`
+    /// ceilings and `/status` do not silently reset to zero on resume.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub prompt_tokens: u64,
+    /// Cumulative completion tokens for the session.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub completion_tokens: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 fn session_schema_version() -> u32 {
@@ -82,6 +93,8 @@ impl Session {
             messages: Vec::new(),
             checkpoints: Vec::new(),
             branched_from: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
         }
     }
 
@@ -164,17 +177,16 @@ impl Session {
         Ok(branched)
     }
 
-    /// One-line-per-checkpoint listing for `/checkpoints` and the CLI.
-    pub fn checkpoint_list(&self) -> String {
-        if self.checkpoints.is_empty() {
-            return "no checkpoints yet — create one with /checkpoint [label]".into();
-        }
+    /// One picker row per checkpoint: id first, so a selection can be fed
+    /// straight back to `branch_from`. Shared by `/checkpoints` (picker) and
+    /// `checkpoint_list` (plain text) so the two never drift.
+    pub fn checkpoint_items(&self) -> Vec<String> {
         self.checkpoints
             .iter()
             .enumerate()
             .map(|(i, cp)| {
                 format!(
-                    "#{:<3} {} · {} msg{} · {}{}",
+                    "#{} {} · {} msg{} · {}{}",
                     i + 1,
                     cp.id,
                     cp.message_count,
@@ -186,8 +198,15 @@ impl Session {
                         .unwrap_or_default()
                 )
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
+    }
+
+    /// One-line-per-checkpoint listing for the CLI.
+    pub fn checkpoint_list(&self) -> String {
+        if self.checkpoints.is_empty() {
+            return "no checkpoints yet — create one with /checkpoint [label]".into();
+        }
+        self.checkpoint_items().join("\n")
     }
 
     /// Restore a session's conversation (skipping its system prompt —
@@ -196,15 +215,20 @@ impl Session {
         self.messages.clone()
     }
 
+    /// `~/.local/share/laudacode` — the root for everything we persist
+    /// outside the config file (sessions).
+    pub fn data_dir() -> PathBuf {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("laudacode")
+    }
+
     pub fn dir() -> PathBuf {
         // Override keeps tests away from real user data.
         if let Ok(p) = std::env::var("LAUDACODE_SESSIONS_DIR") {
             return PathBuf::from(p);
         }
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("laudacode")
-            .join("sessions")
+        Self::data_dir().join("sessions")
     }
 
     pub fn path_for(id: &str) -> PathBuf {
@@ -580,6 +604,32 @@ mod tests {
         let b = Session::new();
         assert_ne!(a.id, b.id, "ids built from distinct nanos must differ");
         assert!(a.id.contains('-'));
+    }
+
+    #[test]
+    fn usage_totals_survive_a_save_and_load() {
+        // Before this, a resume reset the token counters to zero, which handed
+        // the user a fresh `max_cost_usd` allowance every time they resumed.
+        let (_g, _dir) = test_env();
+        let mut s = Session::new();
+        s.prompt_tokens = 12_345;
+        s.completion_tokens = 678;
+        s.save().unwrap();
+        let loaded = Session::load(&s.id).expect("loads");
+        assert_eq!(loaded.prompt_tokens, 12_345);
+        assert_eq!(loaded.completion_tokens, 678);
+    }
+
+    #[test]
+    fn sessions_written_before_usage_existed_still_load() {
+        // Both fields are `#[serde(default)]`, so an older session file is
+        // valid input rather than a parse failure that loses the transcript.
+        let v = serde_json::json!({
+            "id": "1-abc",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let s: Session = serde_json::from_value(v).expect("legacy session must parse");
+        assert_eq!((s.prompt_tokens, s.completion_tokens), (0, 0));
     }
 
     #[test]

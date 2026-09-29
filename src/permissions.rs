@@ -36,6 +36,11 @@ pub struct Permissions {
     pub read: Option<PatternMap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webfetch: Option<PatternMap>,
+    /// MCP tools keyed by qualified name (`mcp__<server>__<tool>`). MCP tools
+    /// are third-party code, so this is the only way to deny or prompt for one
+    /// without giving up on the server entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<PatternMap>,
 }
 
 impl Permissions {
@@ -47,12 +52,14 @@ impl Permissions {
     /// - edit: the target file path
     /// - read: the file path
     /// - webfetch: the URL
+    /// - mcp: the qualified tool name
     pub fn resolve(&self, tool: &str, input: &str) -> Option<Rule> {
         let map = match tool {
             "bash" => self.bash.as_ref()?,
             "edit" => self.edit.as_ref()?,
             "read" => self.read.as_ref()?,
             "webfetch" => self.webfetch.as_ref()?,
+            "mcp" => self.mcp.as_ref()?,
             _ => return None,
         };
         // Last matching pattern wins (documented contract).

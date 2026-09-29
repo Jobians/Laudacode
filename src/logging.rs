@@ -116,14 +116,16 @@ impl Logger {
         self.event("tool", json!({ "tool": name, "ok": ok, "detail": detail }));
     }
 
-    pub fn usage(&self, model: &str, prompt: u64, completion: u64) {
+    /// `prompt`/`completion` are cumulative session totals; `cost` is the
+    /// session cost for the model those totals were billed at.
+    pub fn usage(&self, model: &str, prompt: u64, completion: u64, cost: f64) {
         self.event(
             "usage",
             json!({
                 "model": model,
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
-                "est_cost_usd": crate::budget::estimate_cost(prompt, completion),
+                "est_cost_usd": cost,
             }),
         );
     }
@@ -152,7 +154,7 @@ mod tests {
         };
         let l = Logger::from_config(&cfg);
         assert!(l.is_active());
-        l.usage("gpt-x", 100, 20);
+        l.usage("gpt-x", 100, 20, 0.09);
         l.tool("read_file", true, "src/main.rs");
         let raw = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = raw.lines().collect();

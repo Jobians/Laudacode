@@ -131,12 +131,17 @@ pub const LOGOS: &[Art] = &[
         name: "terminal",
         rows: &[
             &[Seg::rule(" ╭─────────────────────────────────╮")],
+            // ponytail: the trailing pad below is hand-fitted to a 7-char
+            // version ("v0.10.0"); a 2-digit patch or 3-digit component (v1.0.0
+            // / v0.10.10) makes this row a char wide and
+            // `every_logo_fits_the_banner_band` says so. If versions get that
+            // long, give Seg a `Cow<'static, str>` and pad the slot at runtime.
             &[
                 Seg::rule(" │"),
                 Seg::glow(" ⎈"),
                 Seg::rule("  laudacode   "),
                 Seg::glow(concat!("v", env!("CARGO_PKG_VERSION"))),
-                Seg::rule("           │"),
+                Seg::rule("          │"),
             ],
             &[Seg::rule(" │                                 │")],
             &[
@@ -647,9 +652,64 @@ enum Tap {
 }
 
 /// A modal picker over a list of strings (models, providers, ...).
+/// A picker row: the thing you pick, plus the context that tells you whether
+/// you picked the right one. Rendering the two at different weights is what
+/// makes a list of models or providers read as a UI instead of a text dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerRow {
+    pub label: String,
+    pub detail: String,
+    /// Short status chip, e.g. "active". Empty when there is
+    /// nothing worth saying.
+    pub badge: String,
+}
+
+impl PickerRow {
+    pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            badge: String::new(),
+        }
+    }
+
+    pub fn badge(mut self, b: impl Into<String>) -> Self {
+        self.badge = b.into();
+        self
+    }
+
+    /// Derive a row from a `"label · detail · detail"` string, the shape
+    /// every existing call site already builds. Only the first separator
+    /// splits: the rest is context and belongs in the dimmed column.
+    pub fn parse(s: &str) -> Self {
+        match s.split_once(" · ") {
+            Some((label, rest)) => Self::new(label.trim(), rest.trim()),
+            None => Self::new(s.trim(), ""),
+        }
+    }
+
+    /// What a selection hands back to the caller. Unchanged from the old
+    /// flat-string rows, so every existing `split(" · ")` parse still works.
+    pub fn to_wire(&self) -> String {
+        if self.detail.is_empty() {
+            self.label.clone()
+        } else {
+            format!("{} · {}", self.label, self.detail)
+        }
+    }
+
+    fn haystack(&self) -> String {
+        if self.detail.is_empty() {
+            self.label.to_lowercase()
+        } else {
+            format!("{} {}", self.label, self.detail).to_lowercase()
+        }
+    }
+}
+
 struct Picker {
     title: String,
-    items: Vec<String>,
+    items: Vec<PickerRow>,
     selected: usize,
     filter: String,
 }
@@ -757,7 +817,7 @@ impl Picker {
         self.items
             .iter()
             .enumerate()
-            .filter(|(_, s)| f.is_empty() || s.to_lowercase().contains(&f))
+            .filter(|(_, r)| f.is_empty() || r.haystack().contains(&f))
             .map(|(i, _)| i)
             .collect()
     }
@@ -934,8 +994,10 @@ fn shorten_id(id: &str) -> String {
     }
 }
 
-/// Built-in slash commands surfaced by the composer autocomplete.
-const SLASH_COMMANDS: &[(&str, &str)] = &[
+/// Built-in slash commands surfaced by the composer autocomplete. `pub(crate)`
+/// so the dispatcher in `repl.rs` can assert every command it handles is listed
+/// here — that hand-maintained table is exactly how `/agents` went missing once.
+pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show all commands"),
     ("/model", "pick a model from the live list"),
     (
@@ -943,6 +1005,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "thinking depth: normal · low · medium · high · max (auto-detected)",
     ),
     ("/approvals", "switch approval mode (plan/build/full-auto)"),
+    ("/agents", "list sub-agents and their roles"),
     ("/provider", "menu: add · use · edit · list"),
     ("/compact", "summarize history to free context"),
     ("/clear", "reset the conversation"),
@@ -955,6 +1018,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/branch", "branch a new session from a checkpoint"),
     ("/image", "attach an image to your next message"),
     ("/status", "provider · model · session info"),
+    ("/mcp", "external MCP tool servers · status"),
+    ("/lsp", "language servers · status"),
     ("/diff", "show uncommitted git changes"),
     ("/review", "reviewer analyzes uncommitted changes"),
     ("/undo", "revert file changes from the last turn"),
@@ -1485,7 +1550,21 @@ impl Tui {
         self.status = None;
     }
 
+    /// The open picker's title and items, for tests.
+    #[cfg(test)]
+    pub fn picker_view(&self) -> Option<(&str, &[PickerRow])> {
+        self.picker
+            .as_ref()
+            .map(|p| (p.title.as_str(), p.items.as_slice()))
+    }
+
     pub fn open_picker(&mut self, title: impl Into<String>, items: Vec<String>) {
+        self.open_picker_rows(title, items.iter().map(|s| PickerRow::parse(s)).collect());
+    }
+
+    /// Pickers that carry real status (active provider, signed in, current
+    /// model) pass explicit rows so they can show a badge.
+    pub fn open_picker_rows(&mut self, title: impl Into<String>, items: Vec<PickerRow>) {
         self.picker = Some(Picker {
             title: title.into(),
             items,
@@ -1665,7 +1744,7 @@ impl Tui {
                     lines.push(Line::from(vec![
                         Span::styled("┌─ ", Style::default().fg(crate::theme::get().accent2)),
                         Span::styled(
-                            format!("{} (+{} −{})", f.path, f.added, f.removed),
+                            f.path.clone(),
                             Style::default()
                                 .fg(crate::theme::get().accent2)
                                 .add_modifier(Modifier::BOLD),
@@ -2104,8 +2183,7 @@ impl Tui {
         // Composer — the focused widget, so its border always uses the
         // focus accent (the active mode color) rather than a raw grey.
         let comp_style = Style::default().fg(self.mode.color());
-        const PLACEHOLDER: &str =
-            "ask laudacode anything — @ to mention files, # to remember, / for commands";
+
         let cursor_ok = self.pending_approval.is_none();
         let comp_inner_w = composer_area.width.saturating_sub(2).max(10) as usize;
         let text: Vec<Line> = if self.input.is_empty() && !cursor_ok {
@@ -2117,7 +2195,7 @@ impl Tui {
             ))]
         } else if self.input.is_empty() {
             vec![Line::from(Span::styled(
-                PLACEHOLDER,
+                Self::placeholder_for(comp_inner_w),
                 Style::default().fg(crate::theme::get().dim),
             ))]
         } else {
@@ -2223,8 +2301,16 @@ impl Tui {
         let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(footer_area);
         let brand = " LaudaCode ";
-        let mode_chip = format!(" {} ", self.mode.label());
         let brand_w = UnicodeWidthStr::width(brand) as u16;
+        // The mode is already stated in the slim header wordmark, so repeating
+        // it in the footer just says the same word twice. The composer carries
+        // a mode pill too, and that one is adjacent to the caret.
+        let show_chip = header_rows != HEADER_COMPACT;
+        let mode_chip = if show_chip {
+            format!(" {} ", self.mode.label())
+        } else {
+            String::from("  ")
+        };
         let chip_w = UnicodeWidthStr::width(mode_chip.as_str()) as u16;
         // Tapping the brand or mode chip in the footer toggles banner / mode.
         self.tap_targets.push((
@@ -2494,6 +2580,21 @@ impl Tui {
     }
 
     /// Clamp a display string to `w` cells (unicode-width aware-ish).
+    /// Composer hint text, trimmed to the available inner width.
+    ///
+    /// This was a fixed 74-character string, so any composer narrower than
+    /// that clipped the tail mid-word. The full text is kept as the source of
+    /// truth and truncated here instead.
+    fn placeholder_for(inner_w: usize) -> String {
+        const FULL: &str = "ask laudacode anything — @ mention · # remember · / commands";
+        // Below this the tail is worthless anyway; say less rather than
+        // ellipsising into noise.
+        if inner_w < 18 {
+            return Self::truncate_to("ask laudacode…".to_string(), inner_w);
+        }
+        Self::truncate_to(FULL.to_string(), inner_w)
+    }
+
     fn truncate_to(s: String, w: usize) -> String {
         if UnicodeWidthStr::width(s.as_str()) <= w {
             return s;
@@ -2809,7 +2910,9 @@ impl Tui {
         const MAX_VISIBLE: usize = POPUP_MAX_VISIBLE;
         let visible = matches.len().min(MAX_VISIBLE);
         let height = visible as u16 + 2; // borders
-        let width = area.width.clamp(28, 52);
+                                         // Full width, not a clamped box: anything narrower leaves the row's
+                                         // other content (the compact summary) poking out beside the border.
+        let width = area.width;
         let y = composer.y.saturating_sub(height);
         if y < area.y {
             return; // not enough room above the composer
@@ -2892,7 +2995,7 @@ impl Tui {
         const MAX_VISIBLE: usize = POPUP_MAX_VISIBLE;
         let visible = matches.len().min(MAX_VISIBLE);
         let height = visible as u16 + 2;
-        let width = area.width.clamp(30, 56);
+        let width = area.width;
         // Stack above the slash popup when both would collide.
         let slash_h = if self.slash_popup_active() {
             POPUP_MAX_VISIBLE as u16 + 2
@@ -2993,27 +3096,74 @@ impl Tui {
         let sel_pos = idxs.iter().position(|i| *i == p.selected).unwrap_or(0);
         let start = sel_pos.saturating_sub(max / 2);
         let sel_style = selection_style();
+        // Budget for the row text: one leading space plus the scrollbar column.
+        // Without this a long item (a provider base URL, an agent description)
+        // was sliced at the panel edge, cutting mid-word with no sign that
+        // anything was lost.
+        // Width budget, left to right: selection marker, scrollbar, badge
+        // chip, then the text. Getting this wrong silently clips the badge,
+        // which is the one part of the row that carries meaning.
+        let marker_w = 3usize;
+        let scrollbar_w = 1usize;
+        let badge_w: usize = idxs
+            .iter()
+            .filter_map(|i| p.items.get(*i))
+            .map(|r| r.badge.chars().count())
+            .max()
+            .unwrap_or(0);
+        // +1 for a guaranteed gap, so a chip never butts against the text.
+        let chip_w = if badge_w > 0 { badge_w + 1 } else { 0 };
+        let text_avail = (rows[1].width as usize).saturating_sub(marker_w + scrollbar_w + chip_w);
+        // The label wins ties but never eats the whole row — a provider with
+        // a very long name must still show where it points.
+        let label_cap = (text_avail / 2).max(8);
         let items: Vec<ListItem> = idxs
             .iter()
             .skip(start)
             .take(max)
             .map(|i| {
-                let style = if *i == p.selected {
+                let row = &p.items[*i];
+                let selected = *i == p.selected;
+                let label_style = if selected {
                     sel_style
                 } else {
                     Style::default().fg(theme.text)
                 };
-                ListItem::new(Line::from(vec![
+                let label = Self::truncate_to(row.label.clone(), label_cap);
+                let used = label.chars().count();
+                // The trailing 1 is the gap before the chip.
+                let det_budget =
+                    text_avail.saturating_sub(used + 2 + usize::from(!row.badge.is_empty()));
+                let mut spans = vec![
                     Span::styled(
-                        " ",
-                        if *i == p.selected {
+                        if selected { " ▸ " } else { "   " },
+                        if selected {
                             sel_style
                         } else {
                             Style::default()
                         },
                     ),
-                    Span::styled(p.items[*i].clone(), style),
-                ]))
+                    Span::styled(label, label_style),
+                ];
+                // Context sits in the dimmed column so the eye lands on the
+                // label first, padded to a fixed width so the chips line up.
+                if !row.detail.is_empty() && det_budget > 1 {
+                    let det = Self::truncate_to(row.detail.clone(), det_budget);
+                    let pad = det_budget.saturating_sub(det.chars().count());
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(det, Style::default().fg(theme.dim)));
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                if !row.badge.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        row.badge.clone(),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
         f.render_widget(List::new(items), rows[1]);
@@ -3543,7 +3693,11 @@ impl Tui {
             )
         };
         self.picker = None;
-        Some(Action::OpenSlash(format!("{}:{}", tapped.1, tapped.0)))
+        Some(Action::OpenSlash(format!(
+            "{}:{}",
+            tapped.1,
+            tapped.0.to_wire()
+        )))
     }
 
     /// Place the editing caret nearest the tapped point inside the composer.
@@ -3623,7 +3777,7 @@ impl Tui {
                         let chosen = p.items[*i].clone();
                         let title = p.title.clone().to_lowercase();
                         self.picker = None;
-                        action = Action::OpenSlash(format!("{title}:{chosen}"));
+                        action = Action::OpenSlash(format!("{title}:{}", chosen.to_wire()));
                     }
                 }
                 _ => {}
@@ -4496,7 +4650,11 @@ mod tests {
     fn tab_completes_highlighted_command() {
         let mut t = Tui::new();
         t.input = "/mod".into();
-        assert_eq!(t.slash_matches(), vec![1]); // /model
+        let model = SLASH_COMMANDS
+            .iter()
+            .position(|(c, _)| *c == "/model")
+            .expect("/model is listed");
+        assert_eq!(t.slash_matches(), vec![model]);
         t.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(t.input, "/model ");
         // Popup closed after completion (trailing space).
@@ -4566,8 +4724,14 @@ mod tests {
         t.on_key(key(KeyCode::Down, KeyModifiers::NONE)); // sel=1
         t.on_key(key(KeyCode::Char('l'), KeyModifiers::NONE)); // "/cl"
         assert_eq!(t.slash_sel, 0);
-        // Matches for "/cl": /clear only.
-        assert_eq!(t.slash_matches(), vec![6]);
+        // Matches for "/cl": /clear only. Look the index up rather than
+        // hardcoding it — inserting a command above /clear must not break a
+        // test that is only about selection reset.
+        let clear = SLASH_COMMANDS
+            .iter()
+            .position(|(c, _)| *c == "/clear")
+            .expect("/clear is listed");
+        assert_eq!(t.slash_matches(), vec![clear]);
     }
 
     #[test]
@@ -4780,6 +4944,29 @@ mod tests {
     }
 
     #[test]
+    fn the_placeholder_fits_the_composer_at_every_width() {
+        // The real invariant, on the function that produces the text: what is
+        // drawn is never wider than the space it has, and a too-long
+        // placeholder is marked with an ellipsis rather than cut mid-word.
+        const FULL: &str = "ask laudacode anything — @ mention · # remember · / commands";
+        for inner_w in [4usize, 10, 18, 24, 40, 60, 72, 74, 100, 200] {
+            let got = Tui::placeholder_for(inner_w);
+            assert!(
+                UnicodeWidthStr::width(got.as_str()) <= inner_w,
+                "placeholder is {inner_w}+ wide: {got:?}"
+            );
+            if got.len() < FULL.len() {
+                assert!(
+                    got.ends_with('…'),
+                    "truncated placeholder is not marked: {got:?}"
+                );
+            }
+        }
+        // Wide enough: the full hint set, untouched.
+        assert_eq!(Tui::placeholder_for(74), FULL);
+    }
+
+    #[test]
     fn tool_diffs_render_in_color() {
         use crate::diff::unified_diff;
         let d = unified_diff("src/lib.rs", "a\nb\n", "a\nc\n", 1);
@@ -4791,7 +4978,14 @@ mod tests {
         let lines = line_texts(&t, 60);
         let joined = lines.join("\n");
         assert!(joined.contains("✎ edit_file"), "{joined}");
-        assert!(joined.contains("┌─ src/lib.rs (+1 −1)"), "{joined}");
+        // The per-file header carries only the path: the counts already
+        // appear on the summary line above it, and repeating them read as a
+        // rendering glitch.
+        assert!(joined.contains("┌─ src/lib.rs"), "{joined}");
+        assert!(
+            !joined.contains("src/lib.rs (+1"),
+            "per-file counts are duplicated: {joined}"
+        );
         assert!(joined.contains("│-b"), "{joined}");
         assert!(joined.contains("│+c"), "{joined}");
         // Colors are attached to the right kinds: the bar keeps its
@@ -5218,6 +5412,149 @@ mod tests {
                 }),
             ),
             (
+                "providers picker",
+                Box::new(|t: &mut Tui| {
+                    t.entries.push(Entry::User("switch to openrouter".into()));
+                    t.open_picker_rows(
+                        "provider_use",
+                        vec![
+                            PickerRow::new(
+                                "openrouter",
+                                "stealth/ox-alpha · https://openrouter.ai/api/v1",
+                            )
+                            .badge("active"),
+                            PickerRow::new("ollama", "qwen3:8b · http://localhost:11434/v1"),
+                            PickerRow::new(
+                                "groq",
+                                "llama-3.3-70b · https://api.groq.com/openai/v1",
+                            ),
+                            PickerRow::new("perplexity", "sonar · https://api.perplexity.ai"),
+                        ],
+                    );
+                }),
+            ),
+            (
+                "sessions picker",
+                Box::new(|t: &mut Tui| {
+                    t.entries.push(Entry::User("which session?".into()));
+                    t.open_picker_rows(
+                        "resume",
+                        vec![
+                            PickerRow::new(
+                                "parser work",
+                                "1790480839-8d37e49d2efd · 2025-09-27 · fix the tokenizer",
+                            )
+                            .badge("current"),
+                            PickerRow::new(
+                                "(unnamed)",
+                                "1790484022-aa11bb22cc33 · 2025-09-27 · list the files here",
+                            ),
+                            PickerRow::new(
+                                "lsp diagnostics",
+                                "1790477001-9f8e7d6c5b4a · 2025-09-26 · wire the lsp tool in",
+                            ),
+                        ],
+                    );
+                }),
+            ),
+            (
+                "models picker",
+                Box::new(|t: &mut Tui| {
+                    t.entries.push(Entry::User("pick a model".into()));
+                    t.open_picker_rows(
+                        "model",
+                        vec![
+                            PickerRow::new("stealth/ox-alpha", "").badge("active"),
+                            PickerRow::new("anthropic/claude-sonnet-4.5", ""),
+                            PickerRow::new("google/gemini-2.5-pro", ""),
+                            PickerRow::new("openai/gpt-5-codex", ""),
+                            PickerRow::new("type a model id manually…", ""),
+                        ],
+                    );
+                }),
+            ),
+            (
+                "agents picker",
+                Box::new(|t: &mut Tui| {
+                    t.entries
+                        .push(Entry::User("who should review this?".into()));
+                    let items: Vec<String> = crate::agents::all_roles()
+                        .into_iter()
+                        .map(|r| {
+                            // The tag sits next to the name, not at the end:
+                            // appended, a long description truncates it away,
+                            // and read-only-ness is the thing you most need to
+                            // see before picking.
+                            let tag = if r.read_only { " (read-only)" } else { "" };
+                            format!("{}{tag} · {}", r.name, r.description)
+                        })
+                        .collect();
+                    t.open_picker("agents", items);
+                }),
+            ),
+            (
+                "real session",
+                Box::new(|t: &mut Tui| {
+                    t.entries
+                        .push(Entry::User("wire the lsp tool into the agent".into()));
+                    t.entries.push(Entry::Reasoning(
+                        "MCP uses newline framing but LSP needs Content-Length headers.".into(),
+                    ));
+                    t.entries.push(Entry::Assistant(
+                        "Found it. Lsp::notify writes the raw JSON body, so every server \
+rejects the handshake."
+                            .into(),
+                    ));
+                    t.entries.push(Entry::ToolCall {
+                        name: "edit_file".into(),
+                        summary: "src/lsp.rs".into(),
+                    });
+                    t.entries.push(Entry::ToolDiff {
+                        name: "edit_file".into(),
+                        files: vec![crate::diff::FileDiff {
+                            path: "src/lsp.rs".into(),
+                            added: 2,
+                            removed: 1,
+                            lines: vec![
+                                crate::diff::DiffLine {
+                                    kind: crate::diff::LineKind::Del,
+                                    text: "-    c.stdin.write_all(msg.as_bytes())".into(),
+                                },
+                                crate::diff::DiffLine {
+                                    kind: crate::diff::LineKind::Add,
+                                    text: "+    let body = to_vec(msg)?;".into(),
+                                },
+                                crate::diff::DiffLine {
+                                    kind: crate::diff::LineKind::Add,
+                                    text: "+    c.stdin.write_all(&framed).await?;".into(),
+                                },
+                                crate::diff::DiffLine {
+                                    kind: crate::diff::LineKind::Ctx,
+                                    text: "     c.stdin.flush().await?;".into(),
+                                },
+                            ],
+                        }],
+                    });
+                    t.entries.push(Entry::ToolResult {
+                        name: "edit_file".into(),
+                        ok: true,
+                        preview: "edited src/lsp.rs".into(),
+                    });
+                    t.entries.push(Entry::ToolCall {
+                        name: "run_command".into(),
+                        summary: "cargo test lsp".into(),
+                    });
+                    t.entries.push(Entry::ToolResult {
+                        name: "run_command".into(),
+                        ok: true,
+                        preview: "test result: ok. 8 passed; 0 failed".into(),
+                    });
+                    t.entries.push(Entry::Assistant(
+                        "Fixed and verified: clangd now returns the real error.".into(),
+                    ));
+                }),
+            ),
+            (
                 "approval modal",
                 Box::new(|t: &mut Tui| {
                     t.pending_approval = Some("run_command: rm -rf target/".into());
@@ -5238,19 +5575,23 @@ mod tests {
             t.entries.push(Entry::User("tidy up the composer".into()));
             t.entries.push(Entry::Assistant("Restyling chrome.".into()));
             setup(&mut t);
-            let backend = TestBackend::new(74, 22);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|f| t.draw(f)).unwrap();
-            let buf = terminal.backend().buffer().clone();
-            println!("=== {name} ===");
-            for y in 0..buf.area.height {
-                let mut row = String::new();
-                for x in 0..buf.area.width {
-                    row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            // 74x22 is a desktop window; 40x20 is a phone in portrait. Both
+            // must lay out without clipping or overlapping.
+            for (w, h) in [(74u16, 22u16), (40, 20)] {
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| t.draw(f)).unwrap();
+                let buf = terminal.backend().buffer().clone();
+                println!("=== {name} @ {w}x{h} ===");
+                for y in 0..buf.area.height {
+                    let mut row = String::new();
+                    for x in 0..buf.area.width {
+                        row.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+                    }
+                    println!("{}", row.trim_end());
                 }
-                println!("{}", row.trim_end());
+                println!();
             }
-            println!();
         }
     }
 }

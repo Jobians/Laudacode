@@ -20,6 +20,19 @@ use crate::tui::{self as tuiapp, Action as KeyAction, Entry, Tui};
 // Plain terminal UI sink (used by `exec` mode)
 // ---------------------------------------------------------------------------
 
+/// Interpret an approval answer. `None` = unrecognised, re-prompt.
+///
+/// Enter and EOF are a **deny**. An empty line must never approve a
+/// destructive action, and on a closed stdin `read_line` returns `Ok(0)`
+/// with an untouched buffer — so `""` is precisely the EOF case.
+fn parse_yes_no(line: &str) -> Option<bool> {
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "" | "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 pub struct TermUi {
     pub rl: DefaultEditor,
     approve_all: bool,
@@ -27,6 +40,9 @@ pub struct TermUi {
     reasoning_bytes: usize,
     /// `--json`: emit machine-readable event lines instead of prose.
     pub json_out: bool,
+    /// `--quiet`: suppress brand chrome (banner + identity block) so stdout
+    /// carries results only.
+    pub quiet: bool,
 }
 
 impl TermUi {
@@ -38,6 +54,7 @@ impl TermUi {
             in_reasoning: false,
             reasoning_bytes: 0,
             json_out: false,
+            quiet: false,
         })
     }
 
@@ -167,6 +184,28 @@ impl UiSink for TermUi {
         })
     }
 
+    /// MCP tools are third-party code, so "always" does not cover them the
+    /// way it does for local Moderate actions: a server can do anything, and
+    /// the user is unlikely to have read what it does.
+    fn approve_mcp(&mut self, _name: &str, summary: &str) -> bool {
+        println!(
+            "{}{}{}",
+            "? ".yellow().bold(),
+            "Laudacode wants to call: ".bold(),
+            summary
+        );
+        loop {
+            match self.rl.readline("[y]es  [n]o: ") {
+                Ok(l) => match parse_yes_no(&l) {
+                    Some(ok) => return ok,
+                    None => println!("{}", "  please answer y or n".dark_grey()),
+                },
+                // EOF or a closed stdin is not consent.
+                Err(_) => return false,
+            }
+        }
+    }
+
     fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
         if self.approve_all && danger != tools::Danger::High {
             return true;
@@ -185,8 +224,6 @@ impl UiSink for TermUi {
         loop {
             match self.rl.readline("[y]es  [n]o  [a]lways: ") {
                 Ok(line) => match line.trim().to_lowercase().as_str() {
-                    "y" | "yes" => return true,
-                    "" | "n" | "no" => return false,
                     "a" | "always" => {
                         self.approve_all = true;
                         println!(
@@ -195,7 +232,10 @@ impl UiSink for TermUi {
                         );
                         return true;
                     }
-                    _ => continue,
+                    other => match parse_yes_no(other) {
+                        Some(ok) => return ok,
+                        None => continue,
+                    },
                 },
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => return false,
                 Err(_) => return false,
@@ -260,10 +300,23 @@ impl UiSink for TermSubUi {
             println!("{}", "  [DANGEROUS]".red().bold());
         }
         let mut line = String::new();
-        print!("[y]es / [n]o: ");
-        let _ = std::io::stdout().flush();
-        std::io::stdin().read_line(&mut line).is_ok()
-            && matches!(line.trim().to_lowercase().as_str(), "y" | "yes" | "")
+        loop {
+            print!("[y]es / [n]o: ");
+            let _ = std::io::stdout().flush();
+            // `Ok(0)` is EOF, not an empty answer: deny. Without this a closed
+            // or exhausted stdin silently approved every sub-agent action.
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {}
+            }
+            match parse_yes_no(&line) {
+                Some(ok) => return ok,
+                None => {
+                    line.clear();
+                    println!("{}", "  please answer y or n".dark_grey());
+                }
+            }
+        }
     }
 
     fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
@@ -278,6 +331,16 @@ impl UiSink for TermSubUi {
 // ---------------------------------------------------------------------------
 
 /// Events flowing from the worker thread to the TUI.
+/// Flat `"label · detail"` strings into structured rows, so a picker that
+/// has nothing interesting to say still renders with the same layout.
+fn rows(items: Vec<String>) -> Vec<crate::tui::PickerRow> {
+    items
+        .iter()
+        .map(|s| crate::tui::PickerRow::parse(s))
+        .collect()
+}
+
+#[derive(Debug)]
 pub enum WorkerEvent {
     Ev(AgentEvent),
     /// Modal approval request; worker blocks until an answer arrives.
@@ -301,9 +364,11 @@ pub enum WorkerEvent {
         messages: usize,
     },
     /// Generic picker: model lists, resume lists, approval modes…
+    /// Rows are structured so the list can show a label, dimmed context and a
+    /// status chip instead of one flat line.
     Pick {
         title: String,
-        items: Vec<String>,
+        items: Vec<crate::tui::PickerRow>,
     },
     /// The active endpoint changed (model switch, provider switch or a fresh
     /// `/provider add`) — the dashboard must re-render model/provider.
@@ -337,6 +402,10 @@ pub enum WorkerCmd {
     ListProviders,
     ShowProvider,
     Status,
+    /// Report configured MCP servers: connected, failed, or disabled.
+    Mcp,
+    /// Report configured language servers and the file types they own.
+    Lsp,
     ListSkills,
     Diff,
     /// Run the reviewer specialist over uncommitted git changes.
@@ -427,6 +496,13 @@ impl UiSink for WorkerBridge {
             desc.push_str("  [DANGEROUS]");
         }
         let _ = self.tx.send(WorkerEvent::NeedApproval(desc));
+        matches!(self.approve_rx.lock().unwrap().recv(), Ok(true))
+    }
+
+    fn approve_mcp(&mut self, _name: &str, summary: &str) -> bool {
+        let _ = self
+            .tx
+            .send(WorkerEvent::NeedApproval(format!("{summary}  [MCP]")));
         matches!(self.approve_rx.lock().unwrap().recv(), Ok(true))
     }
 
@@ -525,6 +601,20 @@ fn worker_main(
     };
     let approve_rx = Arc::new(std::sync::Mutex::new(approve_rx));
     let mut last_task: Option<String> = None;
+    // MCP servers must be connected before the first turn — the model can only
+    // call tools it was shown. This has to run on *this* runtime: the stderr
+    // drain is a spawned task, and a throwaway runtime would cancel it.
+    // Failures are reported, never fatal; one dead server must not stop the
+    // session.
+    for f in rt.block_on(app.agent.connect_mcp_servers()) {
+        let _ = ev_tx.send(WorkerEvent::Error(format!("MCP server failed: {f}")));
+    }
+    // Language servers are started eagerly for the same reason, and because a
+    // cold rust-analyzer needs a long time to index: better spent warming now
+    // than stalling the first edit of the session.
+    for f in rt.block_on(app.agent.connect_lsp_servers()) {
+        let _ = ev_tx.send(WorkerEvent::Error(format!("LSP server failed: {f}")));
+    }
     // Images queued via /image or the -i flag — consumed by the next Submit.
     let mut pending_images: Vec<String> = std::mem::take(&mut app.pending_images);
 
@@ -603,9 +693,21 @@ fn worker_main(
                 let _ = ev_tx.send(WorkerEvent::Busy(true));
                 match rt.block_on(app.agent.client.list_models()) {
                     Ok(models) => {
+                        let current = app.agent.model.clone();
+                        let items = with_manual_model_entry(models)
+                            .into_iter()
+                            .map(|m| {
+                                let r = crate::tui::PickerRow::new(&m, "");
+                                if m == current {
+                                    r.badge("active")
+                                } else {
+                                    r
+                                }
+                            })
+                            .collect();
                         let _ = ev_tx.send(WorkerEvent::Pick {
                             title: "model".into(),
-                            items: with_manual_model_entry(models),
+                            items,
                         });
                     }
                     Err(e) => {
@@ -616,10 +718,33 @@ fn worker_main(
             }
             WorkerCmd::SetModel(model) => {
                 app.agent.model = model.clone();
+                // Remember the pick on the stored provider, which is the source
+                // of truth for the next launch. The provider switch was
+                // already persisted, so not persisting the model left the two
+                // halves of "what I was using" disagreeing across restarts.
+                // Mirrors SetReasoning below, deliberately.
+                let name = app.active.name.clone();
+                let remembered = match app.config.providers.get_mut(&name) {
+                    Some(p) => {
+                        p.model = model.clone();
+                        app.config.save().is_ok()
+                    }
+                    // A built-in provider has no config entry to write to, and
+                    // inventing one here would strand a key that is only in the
+                    // environment. Say so instead of silently losing the pick.
+                    None => false,
+                };
                 let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
-                    provider: app.active.name.clone(),
-                    model,
+                    provider: name,
+                    model: model.clone(),
                 });
+                if !remembered {
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "model set for this session only — provider '{}' is not saved, \
+so it will not be remembered",
+                        app.active.name
+                    )));
+                }
             }
             WorkerCmd::SetReasoning(effort) => {
                 // Persist on the stored provider (source of truth), mirror on
@@ -769,8 +894,59 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 } else {
                     let _ = ev_tx.send(WorkerEvent::Pick {
                         title: "skills".into(),
-                        items,
+                        items: rows(items),
                     });
+                }
+            }
+            WorkerCmd::Lsp => {
+                if let Some(e) = app.agent.lsp_error.clone() {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("[lsp_servers] ignored: {e}")));
+                } else if app.agent.lsp.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "No language servers configured. Add one under \
+                         [lsp_servers.<name>] in config.toml, e.g. rust-analyzer \
+                         or clangd from Termux."
+                            .to_string(),
+                    ));
+                } else {
+                    let mut txt = String::new();
+                    for s in &app.agent.lsp.servers {
+                        let state = match s.last_error() {
+                            Some(e) => format!("failed — {e}"),
+                            None if s.is_running() => "running".to_string(),
+                            None => "not started".to_string(),
+                        };
+                        let exts: Vec<&str> = s.spec.filetypes.keys().map(String::as_str).collect();
+                        txt.push_str(&format!(
+                            "  {:<10} {state}\n             handles: {}\n",
+                            s.name,
+                            exts.join(", ")
+                        ));
+                    }
+                    let _ = ev_tx.send(WorkerEvent::Info(txt));
+                }
+            }
+            WorkerCmd::Mcp => {
+                if app.agent.mcp.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "No MCP servers configured. Add one under \
+                         [mcp_servers.<name>] in config.toml."
+                            .to_string(),
+                    ));
+                } else {
+                    let mut txt = String::new();
+                    for s in &app.agent.mcp.servers {
+                        let state = match &s.last_error {
+                            Some(e) => format!("failed — {e}"),
+                            None => format!("{} tool(s)", s.tools.len()),
+                        };
+                        let plan = if s.spec.plan { " · plan" } else { "" };
+                        txt.push_str(&format!("  {:<16} {state}{plan}\n", s.name));
+                        for t in &s.tools {
+                            txt.push_str(&format!("      {}\n", t.qualified));
+                        }
+                    }
+                    let _ = ev_tx.send(WorkerEvent::Info(txt));
                 }
             }
             WorkerCmd::Status => {
@@ -790,7 +966,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 let usage = match a.last_usage {
                     Some(u) => format!(
                         "ctx {} tok · out {} tok",
-                        u.prompt_tokens, u.completion_tokens
+                        // billable_prompt, not raw prompt_tokens: Anthropic
+                        // reports cached tokens outside prompt_tokens but they
+                        // still occupy the context window.
+                        u.billable_prompt(),
+                        u.completion_tokens
                     ),
                     None => "no requests yet".to_string(),
                 };
@@ -951,10 +1131,16 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     let model = app.agent.model.clone();
                     let cwd = app.agent.cwd.clone();
                     let mode = app.agent.mode;
-                    let report = rt.block_on(crate::agents::run_sub_agent(
+                    let res = rt.block_on(crate::agents::run_sub_agent(
                         &client, &model, &cwd, mode, "reviewer", &task, sink,
                     ));
-                    let _ = ev_tx.send(WorkerEvent::Info(format!("review complete:\n{report}")));
+                    // `/review` is a delegation too — charge it, or a free
+                    // full-repo review bypasses `max_cost_usd` entirely.
+                    app.agent.add_usage(res.usage.0, res.usage.1);
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "review complete:\n{}",
+                        res.report
+                    )));
                     let _ = ev_tx.send(WorkerEvent::Busy(false));
                 }
             }
@@ -971,13 +1157,23 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 if recent.is_empty() {
                     let _ = ev_tx.send(WorkerEvent::Info("no saved sessions yet".into()));
                 } else {
+                    let current = app.session.id.clone();
                     let items = recent
                         .into_iter()
                         .map(|(id, name, created, preview)| {
-                            let label = name
-                                .map(|n| format!("{id} · {n}"))
-                                .unwrap_or_else(|| id.clone());
-                            format!("{label} · {} · {preview}", fmt_unix_date(created))
+                            // The name is what a human recognises; the id and
+                            // date are context. Resuming the session you are
+                            // already in is a no-op worth marking.
+                            let label = name.unwrap_or_else(|| "(unnamed)".to_string());
+                            let r = crate::tui::PickerRow::new(
+                                label,
+                                format!("{id} · {} · {preview}", fmt_unix_date(created)),
+                            );
+                            if id == current {
+                                r.badge("current")
+                            } else {
+                                r
+                            }
                         })
                         .collect();
                     let _ = ev_tx.send(WorkerEvent::Pick {
@@ -991,14 +1187,13 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 if hits.is_empty() {
                     let _ = ev_tx.send(WorkerEvent::Info(format!("no sessions match '{kw}'")));
                 } else {
-                    let items = hits
+                    let items: Vec<crate::tui::PickerRow> = hits
                         .into_iter()
                         .map(|(s, preview)| {
-                            let label = s
-                                .name
-                                .map(|n| format!("{} · {n}", s.id))
-                                .unwrap_or_else(|| s.id.clone());
-                            format!("{label} · {} · {preview}", fmt_unix_date(s.created_unix))
+                            crate::tui::PickerRow::new(
+                                s.name.unwrap_or_else(|| "(unnamed)".into()),
+                                format!("{} · {} · {preview}", s.id, fmt_unix_date(s.created_unix)),
+                            )
                         })
                         .collect();
                     let _ = ev_tx.send(WorkerEvent::Pick {
@@ -1008,7 +1203,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                 }
             }
             WorkerCmd::DeleteSession(id) => {
-                let real = id.split(" · ").next().unwrap_or(&id).to_string();
+                let real = session_id_from_row(&id);
                 match Session::delete(&real) {
                     Ok(Some(removed)) => {
                         let _ = ev_tx.send(WorkerEvent::SessionDeleted(removed));
@@ -1039,7 +1234,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             },
             WorkerCmd::ResumeSession(id) => {
                 // Picker items are "id · name · date · preview" — id is first.
-                let real_id = id.split(" · ").next().unwrap_or(&id).to_string();
+                let real_id = session_id_from_row(&id);
                 match resume_session(&mut app, &real_id) {
                     Ok((msg, entries)) => {
                         let _ = ev_tx.send(WorkerEvent::Reload {
@@ -1075,8 +1270,15 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             }
             WorkerCmd::ListCheckpoints => {
                 app.session.messages = app.agent.messages.clone();
-                let list = app.session.checkpoint_list();
-                let _ = ev_tx.send(WorkerEvent::Info(list));
+                let items = app.session.checkpoint_items();
+                if items.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(app.session.checkpoint_list()));
+                } else {
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "checkpoints".into(),
+                        items: rows(items),
+                    });
+                }
             }
             WorkerCmd::BranchCheckpoint(cp_ref) => {
                 app.session.messages = app.agent.messages.clone();
@@ -1123,7 +1325,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                     Ok(models) => {
                         let _ = ev_tx.send(WorkerEvent::Pick {
                             title: "models".into(),
-                            items: with_manual_model_entry(models),
+                            items: rows(with_manual_model_entry(models)),
                         });
                     }
                     Err(_) => {
@@ -1176,11 +1378,28 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         ProviderMenu::Use => "provider_use",
                         ProviderMenu::Edit => "provider_edit",
                     };
+                    let active = app.config.active_provider.clone().unwrap_or_default();
                     let items = app
                         .config
                         .providers
                         .iter()
-                        .map(|(n, p)| format!("{n} · {}", p.model))
+                        .map(|(n, p)| {
+                            // Base url is the part that tells you *where* a
+                            // provider points; the model alone does not.
+                            let detail = match (p.model.is_empty(), p.base_url.is_empty()) {
+                                (false, false) => format!("{} · {}", p.model, p.base_url),
+                                (false, true) => p.model.clone(),
+                                (true, false) => p.base_url.clone(),
+                                (true, true) => "(not configured)".into(),
+                            };
+                            let r = crate::tui::PickerRow::new(n, detail);
+                            let r = if *n == active.as_str() {
+                                r.badge("active")
+                            } else {
+                                r
+                            };
+                            r
+                        })
                         .collect();
                     let _ = ev_tx.send(WorkerEvent::Pick {
                         title: title.into(),
@@ -1200,7 +1419,7 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
                         items.insert(0, "(keep current model)".into());
                         let _ = ev_tx.send(WorkerEvent::Pick {
                             title: "edit model".into(),
-                            items,
+                            items: rows(items),
                         });
                     }
                     Err(e) => {
@@ -1240,6 +1459,11 @@ Create an AGENTS.md file for THIS project in this directory. First explore: read
             }
         }
     }
+    // The command channel is closed, so the TUI is gone. Close the language
+    // servers properly: `shutdown` + `exit` lets them flush their index,
+    // whereas `kill_on_drop` alone throws that away and the next session pays
+    // to rebuild it.
+    rt.block_on(app.agent.lsp.shutdown_all());
     app.persist();
 }
 
@@ -1326,6 +1550,31 @@ pub fn load_image_data_uri(_cwd: &PathBuf, path: &str) -> Result<String> {
 
 /// Replace the live conversation with a stored session. Returns a status
 /// line plus the replayed transcript for the TUI.
+/// Pull a session id out of a picker row. Rows lead with the session *name*
+/// so the list is readable, which means the id can sit anywhere in the row —
+/// so find it by shape (`<unix-seconds>-<hex>`) rather than by position. The
+/// lower bound rejects dates like `2025-09-27`, whose first field would
+/// otherwise look enough like a timestamp.
+fn session_id_from_row(row: &str) -> String {
+    let found = row
+        .split(" · ")
+        .flat_map(|f| f.split_whitespace())
+        .find(|tok| {
+            let Some((secs, rand)) = tok.split_once('-') else {
+                return false;
+            };
+            secs.parse::<u64>().is_ok_and(|n| n >= 1_000_000_000)
+                && !rand.is_empty()
+                && rand.chars().all(|c| c.is_ascii_hexdigit())
+        });
+    match found {
+        Some(id) => id.to_string(),
+        // No recognisable id: keep the old first-field behaviour so a
+        // hand-typed or already-valid id still works.
+        None => row.split(" · ").next().unwrap_or(row).to_string(),
+    }
+}
+
 fn resume_session(app: &mut App, id: &str) -> Result<(String, Vec<Entry>)> {
     let sess = Session::load(id)?;
     let kept: Vec<Message> = sess
@@ -1809,6 +2058,15 @@ impl App {
                         let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
                     } else if let Some(skill) = sel.strip_prefix("skills:") {
                         apply_skill_selection(tui, skill);
+                    } else if let Some(agent) = sel.strip_prefix("agents:") {
+                        apply_agent_selection(tui, agent);
+                    } else if let Some(row) = sel.strip_prefix("checkpoints:") {
+                        // Rows are "#<n> <id> · …", so the branch ref is the
+                        // second field. Branching clones the session, so the
+                        // original is never at risk.
+                        let cp_ref = row.split_whitespace().nth(1).unwrap_or(row).to_string();
+                        tui.set_status("branching from checkpoint");
+                        let _ = ui_cmd.send(WorkerCmd::BranchCheckpoint(cp_ref));
                     } else if let Some(what) = sel.strip_prefix("session_menu:") {
                         // `/session` root menu: rename · search · list · delete.
                         match what.split(" · ").next().unwrap_or("") {
@@ -1853,7 +2111,7 @@ impl App {
                             _ => {}
                         }
                     } else if let Some(id) = sel.strip_prefix("session_delete_list:") {
-                        let real = id.split(" · ").next().unwrap_or(id).to_string();
+                        let real = session_id_from_row(id);
                         tui.pending_delete = Some(real);
                         tui.open_picker(
                             "session_delete_confirm",
@@ -1942,25 +2200,7 @@ impl App {
                                 if free {
                                     // Handled above — nothing more to collect.
                                 } else {
-                                    let ps = tuiapp::ProviderSetup::add(&key, &base_url);
-                                    if ps.need_base_url {
-                                        tui.pending_setup = Some(ps);
-                                        tui.open_input_modal(tuiapp::InputModal::new(
-                                            "Base URL — custom",
-                                            "Paste the full OpenAI-compatible base URL (e.g. https://api.example.com/v1) and press Enter.",
-                                            false,
-                                        ));
-                                        tui.set_status("custom: enter base URL");
-                                    } else {
-                                        tui.pending_setup =
-                                            Some(tuiapp::ProviderSetup::add(&key, &base_url));
-                                        tui.open_input_modal(tuiapp::InputModal::new(
-                                            format!("API key — {key}"),
-                                            format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
-                                            true,
-                                        ));
-                                        tui.set_status(format!("{key}: enter API key"));
-                                    }
+                                    begin_provider_key_setup(tui, &key, &base_url);
                                 }
                             }
                             None => tui.push(Entry::Error("bad provider preset".into())),
@@ -2364,6 +2604,9 @@ impl App {
             ));
         }
         self.session = sess;
+        // Restore the spend already paid for in this session: otherwise
+        // `max_cost_usd` gets a fresh allowance on every resume.
+        self.agent.tot_usage = (self.session.prompt_tokens, self.session.completion_tokens);
         // Replay the restored conversation into the TUI so the user actually
         // SEES their earlier work instead of a blank transcript.
         self.pending_transcript = transcript_entries(&self.agent.messages);
@@ -2390,6 +2633,10 @@ impl App {
             }
         }
         self.session.messages = self.agent.messages.clone();
+        // Carry the token totals so `/status` and `[limits]` survive a resume
+        // instead of restarting from zero and letting the budget refill.
+        self.session.prompt_tokens = self.agent.tot_usage.0;
+        self.session.completion_tokens = self.agent.tot_usage.1;
         if let Err(e) = self.session.save() {
             eprintln!(
                 "{}",
@@ -2400,7 +2647,21 @@ impl App {
 
     /// One-shot non-interactive task (exec mode). `images` are data URIs.
     pub async fn run_once(mut self, task: &str, images: &[String]) -> Result<()> {
-        print_banner();
+        // `exec` never goes through the worker thread, so this is the only
+        // place MCP can connect. Without it the configured servers would be
+        // silently absent from the toolset in one-shot mode.
+        for f in self.agent.connect_mcp_servers().await {
+            eprintln!("{} MCP server failed: {f}", "·".dark_grey());
+        }
+        for f in self.agent.connect_lsp_servers().await {
+            eprintln!("{} LSP server failed: {f}", "·".dark_grey());
+        }
+        // The banner goes to stdout, so it corrupts `--json` output and
+        // buries the answer under 12 rows of art. Both flags mean "stdout is
+        // machine/human readable output only".
+        if !self.ui.json_out && !self.ui.quiet {
+            print_banner();
+        }
         self.ui.begin_turn();
         let res = self.agent.run_turn(task, images, &mut self.ui, None).await;
         self.ui.end_turn();
@@ -2483,7 +2744,7 @@ fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
         }
         // Consumed by tui_main after the loop ends; never reaches the UI.
         WorkerEvent::SessionSummary { .. } => {}
-        WorkerEvent::Pick { title, items } => tui.open_picker(title, items),
+        WorkerEvent::Pick { title, items } => tui.open_picker_rows(title, items),
         WorkerEvent::SessionName(name) => {
             tui.dash.set_name(&name);
         }
@@ -2727,7 +2988,7 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                  SESSION\n\
                    /model        pick a model                                    /status    provider · model · info\n\
                    /reasoning    thinking depth (auto-detected: normal·low·med·high[·max])      /approvals switch approval mode (or Tab)\n\
-                   /agents       list the specialist sub-agent team             /session   rename · search · list\n\
+                   /agents       pick a specialist agent (or /agents <name>)      /session   rename · search · list\n\
                    /skills       search & pick a skill to use                   /resume    restore a previous session\n\
                    /compact      summarize history to free context              /export    save transcript as markdown\n\
                    /retry        re-run the previous task                       /image     attach an image\n\
@@ -2761,8 +3022,43 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                 ],
             );
         }
-        "agents" | "team" => {
-            tui.push(Entry::Info(crate::agents::describe_team()));
+        "agents" | "team" | "agent" => {
+            // A roster dump is not a selection. `/agents` opens a picker;
+            // `/agents <name>` skips straight to prefilling the composer.
+            match arg.first() {
+                None => {
+                    let items = crate::agents::all_roles()
+                        .into_iter()
+                        .map(|r| {
+                            // The tag sits next to the name, not at the end:
+                            // appended, a long description truncates it away,
+                            // and read-only-ness is the thing you most need to
+                            // see before picking.
+                            let tag = if r.read_only { " (read-only)" } else { "" };
+                            format!("{}{tag} · {}", r.name, r.description)
+                        })
+                        .collect::<Vec<_>>();
+                    if items.is_empty() {
+                        tui.push(Entry::Error("no agents registered".into()));
+                    } else {
+                        tui.open_picker("agents", items);
+                    }
+                }
+                Some(name) => {
+                    if crate::agents::find_role(name).is_none() {
+                        let known = crate::agents::all_roles()
+                            .into_iter()
+                            .map(|r| r.name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        tui.push(Entry::Error(format!(
+                            "unknown agent '{name}' — try: {known}"
+                        )));
+                    } else {
+                        apply_agent_selection(tui, name);
+                    }
+                }
+            }
         }
         "skills" => {
             if arg.is_empty() {
@@ -2873,10 +3169,9 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
                 let _ = cmd.send(WorkerCmd::BranchCheckpoint(cp.to_string()));
             }
             None => {
+                // Same picker as /checkpoints: rows are labelled #1, #2, …
+                tui.set_status("pick a checkpoint to branch from");
                 let _ = cmd.send(WorkerCmd::ListCheckpoints);
-                tui.push(Entry::Info(
-                    "pick a checkpoint to branch from — e.g. /branch 1".into(),
-                ));
             }
         },
         "session" => {
@@ -2973,6 +3268,12 @@ fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
             tui.set_status("gathering status");
             let _ = cmd.send(WorkerCmd::Status);
         }
+        "mcp" => {
+            let _ = cmd.send(WorkerCmd::Mcp);
+        }
+        "lsp" => {
+            let _ = cmd.send(WorkerCmd::Lsp);
+        }
         "diff" => {
             tui.set_status("computing diff");
             let _ = cmd.send(WorkerCmd::Diff);
@@ -3038,6 +3339,28 @@ fn apply_skill_selection(tui: &mut Tui, skill: &str) {
     }
     tui.cursor_end();
     tui.set_status("skill added — finish your prompt and press Enter");
+}
+
+/// Put a specialist to work: seed the composer with an explicit delegation
+/// request and let the user type the task. Delegation is a `delegate` tool call
+/// made by the orchestrator, so this is a prompt, not a mode switch — the
+/// agent registry has no "become this agent" concept and inventing one would
+/// be a lie about what the selector does.
+fn apply_agent_selection(tui: &mut Tui, name: &str) {
+    let name = name.split(" · ").next().unwrap_or(name).trim();
+    let phrase = format!("Delegate to the {name} agent: ");
+    if tui.input.trim().is_empty() {
+        tui.input = phrase;
+    } else {
+        if !tui.input.ends_with(' ') {
+            tui.input.push(' ');
+        }
+        tui.input.push_str(&phrase);
+    }
+    tui.cursor_end();
+    tui.set_status(format!(
+        "{name} selected — describe the task and press Enter"
+    ));
 }
 
 /// Keys that are obviously placeholders — warn instead of failing opaquely.
@@ -3361,6 +3684,91 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         kind: "powerbrain",
         model: "gpt-5",
     },
+    // --- OpenAI-compatible providers (base URLs cross-checked against
+    // vendor docs and several independent provider registries, 2026-09).
+    // Every one of these speaks the plain chat-completions wire format, so
+    // they need no transport of their own — only a base URL.
+    ProviderPreset {
+        name: "fireworks",
+        base_url: "https://api.fireworks.ai/inference/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "sambanova",
+        base_url: "https://api.sambanova.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "deepinfra",
+        base_url: "https://api.deepinfra.com/v1/openai",
+        kind: "openai",
+        model: "",
+    },
+    // Chat only: Perplexity serves /chat/completions but has no /models
+    // endpoint, so the model picker cannot list here — type the id instead.
+    ProviderPreset {
+        name: "perplexity",
+        base_url: "https://api.perplexity.ai",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "hyperbolic",
+        base_url: "https://api.hyperbolic.xyz/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "nvidia",
+        base_url: "https://integrate.api.nvidia.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "baseten",
+        base_url: "https://inference.baseten.co/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "upstage",
+        base_url: "https://api.upstage.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "siliconflow",
+        base_url: "https://api.siliconflow.cn/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "minimax",
+        base_url: "https://api.minimax.io/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "huggingface",
+        base_url: "https://router.huggingface.co/v1",
+        kind: "openai",
+        model: "",
+    },
+    // The azure.com host no longer resolves; models.github.ai is the live one.
+    ProviderPreset {
+        name: "githubmodels",
+        base_url: "https://models.github.ai/inference",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "qwen",
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        kind: "openai",
+        model: "",
+    },
     ProviderPreset {
         name: "custom",
         base_url: "",
@@ -3381,9 +3789,57 @@ pub fn is_free_kind(kind: &str) -> bool {
 }
 
 /// Split a `"{key} · {base_url}"` picker label back into its parts.
+///
+/// A row with no detail is normal, not malformed: the `custom` preset has no
+/// base URL until the wizard asks for one, and structured rows drop an empty
+/// detail from the wire. Both yield an empty second half.
 fn parse_preset_label(label: &str) -> Option<(String, String)> {
-    let (k, u) = label.split_once(" · ")?;
-    Some((k.trim().to_string(), u.trim().to_string()))
+    if label.trim().is_empty() {
+        return None;
+    }
+    // Split before trimming: a row with an empty detail still ends in " · ",
+    // and trimming first would swallow the separator.
+    match label.split_once(" · ") {
+        Some((k, u)) => Some((k.trim().to_string(), u.trim().to_string())),
+        None => Some((label.trim().to_string(), String::new())),
+    }
+}
+
+/// Extra headers a preset needs beyond the bearer token.
+///
+/// openrouter wants attribution for its public rankings; nothing else needs
+/// anything special.
+fn preset_headers(base_url: &str) -> std::collections::BTreeMap<String, String> {
+    let mut h: std::collections::BTreeMap<String, String> = Default::default();
+    if base_url.contains("openrouter") {
+        h.extend(parse_headers(
+            "HTTP-Referer: https://github.com/Anon4You/Laudacode, X-Title: Laudacode",
+        ));
+    }
+    h
+}
+
+/// Collect a base URL (custom presets only) and then the API key for a
+/// provider being added.
+fn begin_provider_key_setup(tui: &mut tuiapp::Tui, key: &str, base_url: &str) {
+    let ps = tuiapp::ProviderSetup::add(key, base_url);
+    let need_base_url = ps.need_base_url;
+    tui.pending_setup = Some(ps);
+    if need_base_url {
+        tui.open_input_modal(tuiapp::InputModal::new(
+            "Base URL — custom",
+            "Paste the full OpenAI-compatible base URL (e.g. https://api.example.com/v1) and press Enter.",
+            false,
+        ));
+        tui.set_status("custom: enter base URL");
+    } else {
+        tui.open_input_modal(tuiapp::InputModal::new(
+            format!("API key — {key}"),
+            format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
+            true,
+        ));
+        tui.set_status(format!("{key}: enter API key"));
+    }
 }
 
 /// Mask an API key for transcript display: keep only a short tail.
@@ -3495,11 +3951,7 @@ fn finish_provider_setup(
         api_key: api_key.trim().to_string(),
         kind,
         model: model.trim().to_string(),
-        headers: if base_url.contains("openrouter") {
-            parse_headers("HTTP-Referer: https://github.com/Anon4You/Laudacode, X-Title: Laudacode")
-        } else {
-            Default::default()
-        },
+        headers: preset_headers(base_url),
         reasoning_effort: None,
     };
 
@@ -3856,6 +4308,63 @@ mod tests {
     }
 
     #[test]
+    fn empty_answer_and_eof_deny_rather_than_approve() {
+        // A sub-agent asking for approval in exec mode used to treat `""` as
+        // yes, so a bare Enter — or a closed stdin, where read_line yields
+        // Ok(0) and leaves the buffer empty — approved destructive actions.
+        assert_eq!(parse_yes_no(""), Some(false), "bare enter must deny");
+        assert_eq!(parse_yes_no("\n"), Some(false), "just a newline must deny");
+        assert_eq!(parse_yes_no("   "), Some(false), "whitespace must deny");
+        assert_eq!(parse_yes_no("n"), Some(false));
+        assert_eq!(parse_yes_no("no"), Some(false));
+        assert_eq!(parse_yes_no("y"), Some(true));
+        assert_eq!(parse_yes_no("YES"), Some(true));
+        assert_eq!(parse_yes_no("  yes  "), Some(true));
+        assert_eq!(parse_yes_no("maybe"), None, "re-prompt, never a default");
+    }
+
+    #[test]
+    fn every_dispatched_slash_command_is_advertised() {
+        // The dispatcher is a hand-written match; the popup is a separate
+        // hand-maintained table. They drifted once (`/agents` was handled but
+        // unlisted), so pin the dispatcher names against the table.
+        const DISPATCHED: &[&str] = &[
+            "help",
+            "approvals",
+            "agents",
+            "skills",
+            "compact",
+            "clear",
+            "quit",
+            "provider",
+            "model",
+            "reasoning",
+            "retry",
+            "resume",
+            "checkpoint",
+            "checkpoints",
+            "branch",
+            "session",
+            "image",
+            "export",
+            "init",
+            "status",
+            "diff",
+            "review",
+            "theme",
+            "effect",
+            "undo",
+        ];
+        for name in DISPATCHED {
+            let entry = format!("/{name}");
+            assert!(
+                crate::tui::SLASH_COMMANDS.iter().any(|(c, _)| *c == entry),
+                "`{entry}` is dispatched but missing from the slash autocomplete table"
+            );
+        }
+    }
+
+    #[test]
     fn custom_command_pipeline_end_to_end() {
         let dir = std::env::temp_dir().join(format!("lc-cmds-{}", std::process::id()));
         let cmds = dir.join(".laudacode/commands");
@@ -3958,6 +4467,22 @@ mod tests {
             "zai",
             "novita",
             "chutes",
+            // Added after cross-checking vendor docs and probing each
+            // /models endpoint: a 401/403 proves the path is real, whereas a
+            // 404 means the base URL is wrong and the preset would be dead on
+            // arrival.
+            "fireworks",
+            "sambanova",
+            "deepinfra",
+            "perplexity",
+            "hyperbolic",
+            "nvidia",
+            "baseten",
+            "upstage",
+            "siliconflow",
+            "minimax",
+            "huggingface",
+            "githubmodels",
         ] {
             assert!(
                 PROVIDER_PRESETS.iter().any(|p| p.name == k),
@@ -3975,7 +4500,142 @@ mod tests {
             let parsed = parse_preset_label(&format!("{} · {}", p.name, p.base_url)).unwrap();
             assert_eq!(parsed, (p.name.to_string(), p.base_url.to_string()));
         }
-        assert!(parse_preset_label("no separator here").is_none());
+        // A row with no detail is valid, not malformed: `custom` has no base
+        // url until the wizard asks, and structured rows omit an empty detail
+        // from the wire entirely.
+        assert_eq!(
+            parse_preset_label("custom"),
+            Some(("custom".into(), String::new()))
+        );
+        assert_eq!(parse_preset_label("  "), None);
+        assert_eq!(parse_preset_label(""), None);
+    }
+
+    /// Provider rows now carry `name · model · base_url`; the routing code
+    /// splits on the first separator, so the extra context must not shift it.
+    #[test]
+    fn provider_rows_still_route_on_the_name() {
+        let (name, rest) =
+            parse_preset_label("openrouter · stealth/ox-alpha · https://openrouter.ai/api/v1")
+                .expect("provider row must parse");
+        assert_eq!(name, "openrouter");
+        assert!(rest.contains("stealth/ox-alpha") && rest.contains("openrouter.ai"));
+        // And the two-field form used by the edit menu is unaffected.
+        assert_eq!(
+            parse_preset_label("replace api key · openrouter"),
+            Some(("replace api key".into(), "openrouter".into()))
+        );
+    }
+
+    /// Rows lead with the session name, so the id must be found by shape.
+    /// A positional `split(" · ").next()` here silently resolved to the
+    /// name and `/resume` stopped working.
+    #[test]
+    fn session_id_is_found_by_shape_not_position() {
+        let id = "1790480839-8d37e49d2efd";
+        for row in [
+            format!("my chat · {id} · 2025-09-27 · fix the parser"),
+            format!("{id} · 2025-09-27 · fix the parser"),
+            format!("(unnamed) · {id} · 2025-09-27 · hello"),
+            format!("fix parser in src-2e1a · {id} · 2025-09-27 · x"),
+        ] {
+            assert_eq!(session_id_from_row(&row), id, "row: {row}");
+        }
+        // A date must not pass as a timestamp, and a real id still works
+        // when it is the whole row.
+        assert_eq!(session_id_from_row("2025-09-27 · a · b"), "2025-09-27");
+        assert_eq!(session_id_from_row(id), id);
+    }
+
+    #[test]
+    fn checkpoint_rows_carry_an_unambiguous_branch_ref() {
+        // The picker hands back "#<n> <id> · …" and we feed field 2 to
+        // branch_from. If the row shape changes, this must break loudly
+        // rather than branch from "#3".
+        let (_g, dir) = {
+            let guard = crate::session::test_sync::env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "lc-cp-picker-{}-{}",
+                std::process::id(),
+                crate::session::Session::new().id
+            ));
+            std::env::set_var("LAUDACODE_SESSIONS_DIR", &dir);
+            (guard, dir)
+        };
+        let mut s = crate::session::Session::new();
+        s.messages.push(crate::api::Message::user("hi"));
+        s.create_checkpoint(Some("pre-refactor".into())).unwrap();
+        let row = s.checkpoint_items().remove(0);
+        assert!(row.starts_with("#1 "), "row lost its index: {row}");
+        let cp_ref = row.split_whitespace().nth(1).unwrap().to_string();
+        assert_eq!(cp_ref, s.checkpoints[0].id, "row id must be the branch ref");
+        // And that ref really resolves to the checkpoint we listed.
+        assert!(s.branch_from(&cp_ref).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agents_opens_a_picker_instead_of_dumping_the_roster() {
+        // Regression: /agents used to print a wall of text, so it looked like
+        // nothing happened. A selection UI is the whole point of the command.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tui = Tui::new();
+        assert!(handle_slash(&mut tui, &tx, "/agents"));
+        let (title, items) = tui.picker_view().expect("/agents must open a picker");
+        assert_eq!(title, "agents");
+        assert!(!items.is_empty(), "the agent picker is empty");
+        // Every real specialist is offered, and a read-only one says so.
+        for want in ["planner", "researcher", "coder", "reviewer", "tester"] {
+            assert!(
+                items.iter().any(|i| i.to_wire().starts_with(want)),
+                "{want} missing from the picker: {items:?}"
+            );
+        }
+        // The tag must lead (right after the name) so a long description
+        // cannot truncate it away.
+        assert!(
+            items.iter().any(|i| i.to_wire().contains("(read-only)")),
+            "read-only roles are not marked: {items:?}"
+        );
+        assert!(
+            items.iter().all(|i| !i.to_wire().ends_with("read-only")),
+            "the tag drifted to the end where truncation eats it: {items:?}"
+        );
+    }
+
+    #[test]
+    fn agents_with_a_name_stages_a_delegation_prompt() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tui = Tui::new();
+        assert!(handle_slash(&mut tui, &tx, "/agents coder"));
+        assert!(
+            tui.picker_view().is_none(),
+            "a named agent must skip the picker"
+        );
+        assert_eq!(tui.input, "Delegate to the coder agent: ");
+        // An unknown name is an error, not a silent no-op.
+        let mut tui = Tui::new();
+        assert!(handle_slash(&mut tui, &tx, "/agents nosuchagent"));
+        assert!(
+            tui.input.is_empty(),
+            "a bad name must not touch the composer"
+        );
+
+        // The picker hands back "name · description · read-only", so the
+        // selection path has to strip that back to a bare role name.
+        let mut tui = Tui::new();
+        apply_agent_selection(
+            &mut tui,
+            "planner · Breaks a feature into steps · read-only",
+        );
+        assert_eq!(tui.input, "Delegate to the planner agent: ");
+
+        // And it appends to an existing draft rather than clobbering it.
+        let mut tui = Tui::new();
+        tui.input = "also".into();
+        tui.cursor_end();
+        apply_agent_selection(&mut tui, "tester");
+        assert_eq!(tui.input, "also Delegate to the tester agent: ");
     }
 
     #[test]

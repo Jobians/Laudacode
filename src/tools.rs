@@ -1,15 +1,56 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::api::{FunctionDef, ToolDef};
 
 const MAX_TOOL_OUTPUT: usize = 8 * 1024;
 const MAX_READ_BYTES: u64 = 200 * 1024;
-/// Read-only git subcommands the `git` tool may run. Nothing here can write
-/// to the repository, the index, the working tree or any remote.
-const GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "show", "blame"];
+/// Inspection subcommands. Nothing here writes to the repository, the index,
+/// the working tree or any remote, so these are allowed even in Plan mode.
+const GIT_READ: &[&str] = &["status", "log", "diff", "show", "blame"];
+
+/// Repo-mutating subcommands, local only. Deliberately no `push`, no `fetch`,
+/// no `reset`, no remote or PR operations — those stay behind `run_command`,
+/// which is permission-gated and runs the dangerous-command detector.
+///
+/// No `worktree` either: it needs an add/list/remove lifecycle that only makes
+/// sense alongside the multi-session work in a later phase, and a half-built
+/// version would strand worktrees the user cannot see from the TUI.
+const GIT_WRITE: &[&str] = &["add", "commit", "branch", "checkout", "stash"];
+
+/// Writes that discard or relocate work in ways the approval prompt cannot
+/// show, so they ask even in full-auto regardless of the danger detector.
+const GIT_ALWAYS_ASK: &[&str] = &["checkout", "stash"];
+
+/// Every op the `lsp` tool accepts.
+pub const LSP_OPS: [&str; 5] = [
+    "diagnostics",
+    "definition",
+    "references",
+    "hover",
+    "symbols",
+];
+
+#[derive(Deserialize)]
+struct LspArgs {
+    op: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    line: Option<u64>,
+    #[serde(default)]
+    column: Option<u64>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Every subcommand the `git` tool accepts, reads first.
+fn git_subcommands() -> Vec<&'static str> {
+    GIT_READ.iter().chain(GIT_WRITE).copied().collect()
+}
 
 /// Actions the model can request. Parsed from tool-call arguments.
 #[derive(Debug, Clone)]
@@ -78,16 +119,87 @@ pub enum Action {
         pattern: String,
         path: Option<String>,
     },
+    /// Language-server query. Read-only, but needs the agent's live LSP
+    /// connections, so it is executed by the agent rather than standalone.
+    Lsp {
+        op: String,
+        file: Option<String>,
+        line: Option<u64>,
+        column: Option<u64>,
+        query: Option<String>,
+    },
     /// Read-only git inspection (status, log, diff, show, blame).
     Git {
         subcommand: String,
         path: Option<String>,
         rev: Option<String>,
         limit: Option<u32>,
+        /// Commit message; always set for `commit`, never for anything else.
+        message: Option<String>,
     },
     UpdatePlan {
         todos: Vec<TodoItem>,
     },
+}
+
+/// Render a git action as a shell command line, in the shape a user would
+/// actually type.
+///
+/// Used for the `[permission.bash]` key and the dangerous-command detector, so
+/// a rule written for `git commit -m "…"` matches the action that really runs.
+/// Deliberately unquoted: a rule has to be writable by hand, so the operands
+/// are joined plainly. `Action::describe` formats its own display-oriented
+/// variant (quoted message, `(max N)`) — that one is for humans, and never
+/// feeds a pattern match.
+pub fn git_command_line(
+    subcommand: &str,
+    rev: Option<&str>,
+    path: Option<&str>,
+    message: Option<&str>,
+) -> String {
+    let mut s = format!("git {subcommand}");
+    match subcommand {
+        // Operand is the message, not a revision. `commit` always has one:
+        // parse_tool_action rejects the empty case.
+        "commit" => {
+            if let Some(m) = message {
+                s.push_str(&format!(" -m {m}"));
+            }
+        }
+        // No pathspec means the whole tree, deletions included. Report the
+        // effective `-A` rather than the bare subcommand.
+        "add" => {
+            if let Some(p) = path {
+                s.push_str(&format!(" -- {p}"));
+            } else {
+                s.push_str(" -A");
+            }
+        }
+        // No rev and no path restores the whole tree, not "nothing".
+        "checkout" => match (rev, path) {
+            (Some(r), Some(p)) => s.push_str(&format!(" {r} -- {p}")),
+            (Some(r), None) => s.push_str(&format!(" {r}")),
+            (None, Some(p)) => s.push_str(&format!(" -- {p}")),
+            (None, None) => s.push_str(" -- ."),
+        },
+        // `stash` with no rev is a push; `branch` with no rev lists.
+        "stash" | "branch" => {
+            if let Some(r) = rev {
+                s.push(' ');
+                s.push_str(r);
+            }
+        }
+        _ => {
+            if let Some(r) = rev {
+                s.push(' ');
+                s.push_str(r);
+            }
+            if let Some(p) = path {
+                s.push_str(&format!(" -- {p}"));
+            }
+        }
+    }
+    s
 }
 
 /// One task in the shared todo list (surfaced live in the TUI).
@@ -200,6 +312,10 @@ struct GitArgs {
     rev: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+    /// Commit message. Required for `commit`; `git` is spawned with a null
+    /// stdin so it can never open an editor and hang until the timeout.
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -325,21 +441,60 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<Action> {
                     regex: a.regex,
                 })
             }
+            "lsp" => {
+                let a: LspArgs = serde_json::from_value(v)?;
+                let op = a.op.trim().to_lowercase();
+                if !LSP_OPS.contains(&op.as_str()) {
+                    bail!(
+                        "unsupported lsp op '{}' — use one of: {}",
+                        a.op,
+                        LSP_OPS.join(", ")
+                    );
+                }
+                // A position-taking op without a position would otherwise
+                // quietly fall back to line 1, producing a confident answer
+                // about the wrong line.
+                let needs_pos = matches!(op.as_str(), "definition" | "references" | "hover");
+                if needs_pos && a.file.is_none() {
+                    bail!("lsp {op} needs a `file`");
+                }
+                if needs_pos && (a.line.is_none() || a.column.is_none()) {
+                    bail!("lsp {op} needs `line` and `column` (both 1-based)");
+                }
+                Ok(Action::Lsp {
+                    op,
+                    file: a.file,
+                    line: a.line,
+                    column: a.column,
+                    query: a.query,
+                })
+            }
             "git" => {
                 let a: GitArgs = serde_json::from_value(v)?;
                 let sub = a.subcommand.trim().to_lowercase();
-                if !GIT_SUBCOMMANDS.contains(&sub.as_str()) {
+                if !GIT_READ.contains(&sub.as_str()) && !GIT_WRITE.contains(&sub.as_str()) {
                     bail!(
                         "unsupported git subcommand '{}' — use one of: {}",
                         a.subcommand,
-                        GIT_SUBCOMMANDS.join(", ")
+                        git_subcommands().join(", ")
                     );
                 }
+                // `commit` with no message would spawn an editor against a null
+                // stdin: it hangs until the 60s timeout and then reports a
+                // confusing failure. Fail here, where the model can fix it.
+                if sub == "commit" && a.message.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    bail!("git commit needs a `message`");
+                }
+                let message = a
+                    .message
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
                 Ok(Action::Git {
                     subcommand: sub,
                     path: a.path,
                     rev: a.rev,
                     limit: a.limit,
+                    message,
                 })
             }
             "glob" => {
@@ -459,19 +614,35 @@ impl Action {
                 let where_ = path.as_deref().unwrap_or(".");
                 format!("glob '{pattern}' in {where_}")
             }
+            Action::Lsp {
+                op,
+                file,
+                line,
+                column,
+                ..
+            } => {
+                let at = match (file.as_deref(), *line, *column) {
+                    (Some(f), Some(l), Some(c)) => format!(" {f}:{l}:{c}"),
+                    (Some(f), _, _) => format!(" {f}"),
+                    _ => String::new(),
+                };
+                format!("lsp {op}{at}")
+            }
             Action::Git {
                 subcommand,
                 path,
                 rev,
                 limit,
+                message,
             } => {
-                let mut s = format!("git {subcommand}");
-                if let Some(r) = rev {
-                    s.push_str(&format!(" {r}"));
-                }
-                if let Some(p) = path {
-                    s.push_str(&format!(" -- {p}"));
-                }
+                // Same renderer the permission key and danger detector use, so
+                // the prompt cannot under-report what actually runs.
+                let mut s = git_command_line(
+                    subcommand,
+                    rev.as_deref(),
+                    path.as_deref(),
+                    message.as_deref(),
+                );
                 if let Some(n) = limit {
                     s.push_str(&format!(" (max {n})"));
                 }
@@ -486,23 +657,52 @@ impl Action {
 
     /// Tools that only read state — always allowed, even in Plan mode.
     pub fn is_read_only(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Action::ListDir { .. }
-                | Action::ReadFile { .. }
-                | Action::ViewImage { .. }
-                | Action::Grep { .. }
-                | Action::Glob { .. }
-                | Action::Git { .. }
-                | Action::UpdatePlan { .. }
-                | Action::FetchUrl { .. }
-                | Action::PollProcess { .. }
-                | Action::WebSearch { .. }
-        )
+            | Action::ReadFile { .. }
+            | Action::ViewImage { .. }
+            | Action::Grep { .. }
+            | Action::Glob { .. }
+            | Action::UpdatePlan { .. }
+            | Action::FetchUrl { .. }
+            | Action::PollProcess { .. }
+            | Action::WebSearch { .. } => true,
+            // `git` is read-only only for its inspection subcommands; `add`,
+            // `commit`, `checkout` and friends all write.
+            Action::Git { subcommand, .. } => GIT_READ.contains(&subcommand.as_str()),
+            _ => false,
+        }
+    }
+
+    /// True when this action is a pure read that can be awaited concurrently
+    /// with the rest of its batch.
+    ///
+    /// Narrower than `is_read_only` on purpose. The read-only set also contains
+    /// `view_image`, `update_plan` and `poll_process`, which are read-only but
+    /// not order-independent: they append to the shared image list, update the
+    /// on-screen plan, and advance process output respectively. Deferring those
+    /// would reorder user-visible state.
+    pub fn is_parallel_safe(&self) -> bool {
+        match self {
+            Action::ListDir { .. }
+            | Action::ReadFile { .. }
+            | Action::Grep { .. }
+            | Action::Glob { .. }
+            | Action::FetchUrl { .. }
+            | Action::WebSearch { .. } => true,
+            Action::Git { subcommand, .. } => GIT_READ.contains(&subcommand.as_str()),
+            _ => false,
+        }
     }
 
     /// True when this action can change files on disk (drives post-edit
     /// hooks and the undo snapshots).
+    ///
+    /// `git` is deliberately excluded even for its write subcommands: `checkout`
+    /// and `stash` do rewrite the working tree, but which files they touched is
+    /// only knowable by diffing against HEAD afterwards, and guessing would fire
+    /// hooks on paths the user never edited. Git writes are also excluded from
+    /// `/undo` — see `Agent::snapshot_for_undo`.
     pub fn mutates_files(&self) -> bool {
         matches!(
             self,
@@ -519,9 +719,40 @@ impl Action {
             | Action::WebSearch { .. }
             | Action::Grep { .. }
             | Action::Glob { .. }
-            | Action::Git { .. }
             | Action::PollProcess { .. }
-            | Action::UpdatePlan { .. } => Danger::Safe,
+            | Action::UpdatePlan { .. }
+            | Action::Lsp { .. } => Danger::Safe,
+            Action::Git {
+                subcommand,
+                rev,
+                path,
+                message,
+                ..
+            } => {
+                if GIT_READ.contains(&subcommand.as_str()) {
+                    return Danger::Safe;
+                }
+                // `checkout` and `stash` can discard or relocate uncommitted
+                // work in ways the prompt cannot show, so they always ask.
+                if GIT_ALWAYS_ASK.contains(&subcommand.as_str()) {
+                    return Danger::High;
+                }
+                // Everything else runs through the same detector the shell
+                // uses, so a pattern like `git commit` carrying a `rm -rf`
+                // message is still classified High instead of slipping past
+                // the shell-only path.
+                let cmd = git_command_line(
+                    subcommand,
+                    rev.as_deref(),
+                    path.as_deref(),
+                    message.as_deref(),
+                );
+                if is_dangerous_command(&cmd) {
+                    Danger::High
+                } else {
+                    Danger::Moderate
+                }
+            }
             Action::WriteFile { path, .. } | Action::EditFile { path, .. } => {
                 // Writes outside the workspace always require explicit
                 // approval, even in auto-edit / full-auto modes. Symlink-aware:
@@ -742,8 +973,9 @@ impl Action {
             Action::StartProcess { .. }
             | Action::PollProcess { .. }
             | Action::WriteProcess { .. }
-            | Action::StopProcess { .. } => {
-                bail!("process tools require an owning agent")
+            | Action::StopProcess { .. }
+            | Action::Lsp { .. } => {
+                bail!("this tool requires an owning agent")
             }
             Action::FetchUrl { url } => fetch_url(url).await,
             Action::WebSearch { query, max_results } => web_search(query, *max_results).await,
@@ -766,7 +998,18 @@ impl Action {
                 path,
                 rev,
                 limit,
-            } => run_git(cwd, subcommand, path.as_deref(), rev.as_deref(), *limit).await,
+                message,
+            } => {
+                run_git(
+                    cwd,
+                    subcommand,
+                    path.as_deref(),
+                    rev.as_deref(),
+                    *limit,
+                    message.as_deref(),
+                )
+                .await
+            }
             // The host (REPL) keeps the authoritative plan state; the model
             // only needs confirmation that the list was recorded.
             Action::UpdatePlan { todos } => {
@@ -1211,19 +1454,23 @@ async fn capture_child(
     Ok(report)
 }
 
-/// Run one of `GIT_SUBCOMMANDS` against `cwd`. Arguments are passed as a real
-/// argv (never a shell string), so model-supplied paths/revs cannot inject
-/// extra commands. `path` is a repo-relative pathspec, `rev` a revision or
-/// range (`HEAD~3..HEAD`), and `limit` caps log output.
+/// Run a git subcommand against `cwd`. Arguments are passed as a real argv
+/// (never a shell string), so model-supplied paths/revs cannot inject extra
+/// commands. `path` is a repo-relative pathspec, `rev` a revision or range,
+/// and `limit` caps log output.
+///
+/// Local only: the subcommand allowlist (`GIT_READ` + `GIT_WRITE`) has no
+/// remote operation, so nothing here can reach a network remote.
 async fn run_git(
     cwd: &Path,
     subcommand: &str,
     path: Option<&str>,
     rev: Option<&str>,
     limit: Option<u32>,
+    message: Option<&str>,
 ) -> Result<String> {
     anyhow::ensure!(
-        GIT_SUBCOMMANDS.contains(&subcommand),
+        GIT_READ.contains(&subcommand) || GIT_WRITE.contains(&subcommand),
         "unsupported git subcommand '{subcommand}'"
     );
     let mut cmd = tokio::process::Command::new("git");
@@ -1269,6 +1516,52 @@ async fn run_git(
                 cmd.arg(r);
             }
             cmd.arg("--").arg(p);
+        }
+        // ---- writes ----
+        // No pathspec stages the whole tree. `-A` so deletions are staged too:
+        // a bare `git add` silently skips them and the model reports a commit
+        // that is missing files it thought it added.
+        "add" => match path {
+            Some(p) => {
+                cmd.arg("--").arg(p);
+            }
+            None => {
+                cmd.arg("-A");
+            }
+        },
+        "commit" => {
+            // Null stdin below means no editor; without -m git would sit there
+            // until the timeout. parse_tool_action already rejects this.
+            let m = message.context("git commit needs a `message`")?;
+            cmd.arg("-m").arg(m);
+        }
+        // `rev` is the branch name; with none, this lists branches.
+        "branch" => {
+            if let Some(r) = rev {
+                cmd.arg(r);
+            }
+        }
+        // `rev` switches branches; with a `path` and no `rev` this restores
+        // that one file from HEAD, discarding its local edits.
+        "checkout" => match (rev, path) {
+            (Some(r), Some(p)) => {
+                cmd.arg(r).arg("--").arg(p);
+            }
+            (Some(r), None) => {
+                cmd.arg(r);
+            }
+            (None, Some(p)) => {
+                cmd.arg("--").arg(p);
+            }
+            (None, None) => {
+                cmd.arg("--").arg(".");
+            }
+        },
+        // `rev` is the stash verb: push (default), pop, list, drop, show.
+        "stash" => {
+            if let Some(r) = rev {
+                cmd.arg(r);
+            }
         }
         _ => unreachable!("subcommand validated above"),
     }
@@ -1775,8 +2068,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "view_image",
-                description: "View a local PNG, JPEG, GIF, or WebP using model vision (requires a vision-capable model). Maximum 8 MiB. Image content is attached after this tool batch, not returned as text.",
+                name: Cow::Borrowed("view_image"),
+                description: Cow::Borrowed("View a local PNG, JPEG, GIF, or WebP using model vision (requires a vision-capable model). Maximum 8 MiB. Image content is attached after this tool batch, not returned as text."),
                 parameters: json!({
                     "type": "object",
                     "properties": {"path": {"type": "string", "description": "Local image path, relative to the workspace or absolute"}},
@@ -1787,8 +2080,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "list_dir",
-                description: "List files and folders under a directory (recursive, depth-limited).",
+                name: Cow::Borrowed("list_dir"),
+                description: Cow::Borrowed("List files and folders under a directory (recursive, depth-limited)."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1800,8 +2093,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "read_file",
-                description: "Read a file with line numbers (cat -n style). Large files are paginated — pass offset/limit to continue.",
+                name: Cow::Borrowed("read_file"),
+                description: Cow::Borrowed("Read a file with line numbers (cat -n style). Large files are paginated — pass offset/limit to continue."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1816,8 +2109,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "write_file",
-                description: "Create a file or overwrite it completely with new content.",
+                name: Cow::Borrowed("write_file"),
+                description: Cow::Borrowed("Create a file or overwrite it completely with new content."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1831,8 +2124,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "edit_file",
-                description: "Replace an exact unique substring in a file. old_string must match exactly once. For multi-file or multi-hunk changes prefer apply_patch.",
+                name: Cow::Borrowed("edit_file"),
+                description: Cow::Borrowed("Replace an exact unique substring in a file. old_string must match exactly once. For multi-file or multi-hunk changes prefer apply_patch."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1847,8 +2140,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "apply_patch",
-                description: "Apply a patch that can add, update (with move/rename), and delete multiple files in one call. Format:\n*** Begin Patch\n*** Add File: path\n+lines\n*** Update File: path\n@@ optional context anchor\n-old\n+new\n*** Delete File: path\n*** End Patch\nContext lines start with a space; '@@ <line>' anchors the next chunk; '*** End of File' appends at EOF.",
+                name: Cow::Borrowed("apply_patch"),
+                description: Cow::Borrowed("Apply a patch that can add, update (with move/rename), and delete multiple files in one call. Format:\n*** Begin Patch\n*** Add File: path\n+lines\n*** Update File: path\n@@ optional context anchor\n-old\n+new\n*** Delete File: path\n*** End Patch\nContext lines start with a space; '@@ <line>' anchors the next chunk; '*** End of File' appends at EOF."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1861,8 +2154,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "run_command",
-                description: "Execute a shell command (sh -c) in the working directory and return its output.",
+                name: Cow::Borrowed("run_command"),
+                description: Cow::Borrowed("Execute a shell command (sh -c) in the working directory and return its output."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1875,8 +2168,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "fetch_url",
-                description: "Fetch content from an http(s) URL. HTML pages are converted to plain text. Use for docs, API references, error lookups.",
+                name: Cow::Borrowed("fetch_url"),
+                description: Cow::Borrowed("Fetch content from an http(s) URL. HTML pages are converted to plain text. Use for docs, API references, error lookups."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1889,8 +2182,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "web_search",
-                description: "Search the web and get a list of result titles + URLs for a query. Returns 1-10 top results (no API key needed). Use fetch_url on a result URL to read the full page.",
+                name: Cow::Borrowed("web_search"),
+                description: Cow::Borrowed("Search the web and get a list of result titles + URLs for a query. Returns 1-10 top results (no API key needed). Use fetch_url on a result URL to read the full page."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1904,8 +2197,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "grep",
-                description: "Search file contents across the project and return file:line: match. By default the pattern is matched as literal text; set regex=true for regular expressions (Rust/PCRE-ish syntax: \\d \\w \\s, alternation, anchors). Skips binaries, .git, target/, node_modules/. Combine with context=N for surrounding lines.",
+                name: Cow::Borrowed("grep"),
+                description: Cow::Borrowed("Search file contents across the project and return file:line: match. By default the pattern is matched as literal text; set regex=true for regular expressions (Rust/PCRE-ish syntax: \\d \\w \\s, alternation, anchors). Skips binaries, .git, target/, node_modules/. Combine with context=N for surrounding lines."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1922,15 +2215,16 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "git",
-                description: "Read-only git inspection. subcommand is one of: status (short porcelain + branch), log (oneline history, newest first), diff (working-tree or vs a rev), show (one commit/its diff), blame (line authors for a file). Optionally restrict with a pathspec `path` and a revision/range `rev`; cap log lines with `limit` (default 20). Use this to understand history and current changes without running raw git in a shell.",
+                name: Cow::Borrowed("git"),
+                description: Cow::Borrowed("Inspect and commit locally. READ: status (short porcelain + branch), log (oneline history, newest first), diff (working-tree or vs a rev), show (one commit/its diff), blame (line authors for a file). WRITE: add (stage a pathspec, or everything with no path), commit (needs a message), branch (create, or list with no rev), checkout (switch rev, or restore a path), stash (push/pop/list/drop via rev). Optionally restrict with a pathspec `path` and a revision/range `rev`; cap log lines with `limit` (default 20). There is no push, fetch or reset here — use run_command for those. Not available in Plan mode for the write subcommands."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "subcommand": {"type": "string", "enum": GIT_SUBCOMMANDS, "description": "Read-only git subcommand"},
-                        "path": {"type": "string", "description": "Optional repo-relative pathspec to limit the result"},
-                        "rev": {"type": "string", "description": "Optional revision or range, e.g. HEAD, HEAD~3, main, HEAD~5..HEAD"},
-                        "limit": {"type": "integer", "description": "Max entries for log (default 20, max 500)"}
+                        "subcommand": {"type": "string", "enum": git_subcommands(), "description": "Git subcommand. Local only — no push/fetch/reset."},
+                        "path": {"type": "string", "description": "Optional repo-relative pathspec. For `add` this is what gets staged (omit to stage everything); for `checkout` it restores that path from HEAD."},
+                        "rev": {"type": "string", "description": "Revision, range or name, depending on subcommand: log/diff/show/blame take a rev or range (e.g. HEAD, HEAD~3, main, HEAD~5..HEAD); `branch` takes the new branch name; `checkout` takes the branch to switch to; `stash` takes push|pop|list|drop|show"},
+                        "limit": {"type": "integer", "description": "Max entries for log (default 20, max 500)"},
+                        "message": {"type": "string", "description": "Commit message. Required for `commit`."}
                     },
                     "required": ["subcommand"]
                 }),
@@ -1939,8 +2233,26 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "glob",
-                description: "Find files by pattern. Supports *, ** (any depth), ? (single char). Example: src/**/*.rs finds all Rust files under src/.",
+                name: Cow::Borrowed("lsp"),
+                description: Cow::Borrowed("Query a language server for real compiler diagnostics and code navigation. OPS: diagnostics (errors/warnings for a file, or for every file the server has published about when `file` is omitted), definition (where a symbol is declared), references (every use of a symbol), hover (type signature and docs at a position), symbols (outline of a file, or a workspace-wide search when given `query` instead of `file`). line/column are 1-BASED, matching the line numbers read_file prints. `diagnostics` on a large or cold project may report that analysis is still running rather than a clean result — that is not the same as 'no errors', so re-check before concluding the file is fine."),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "op": {"type": "string", "enum": LSP_OPS, "description": "What to ask the language server."},
+                        "file": {"type": "string", "description": "Repo-relative path. Required for definition/references/hover, optional for diagnostics (omit to get every file) and symbols."},
+                        "line": {"type": "integer", "description": "1-based line number, as printed by read_file. Required for definition/references/hover."},
+                        "column": {"type": "integer", "description": "1-based column. Required for definition/references/hover."},
+                        "query": {"type": "string", "description": "For `symbols` with no `file`: a workspace-wide symbol search string."}
+                    },
+                    "required": ["op"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function",
+            function: FunctionDef {
+                name: Cow::Borrowed("glob"),
+                description: Cow::Borrowed("Find files by pattern. Supports *, ** (any depth), ? (single char). Example: src/**/*.rs finds all Rust files under src/."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1954,8 +2266,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "start_process",
-                description: "Start a long-lived process that keeps running across tool calls (dev server, watcher, REPL). Returns its id. Poll output with poll_process. Plain pipes, not a PTY.",
+                name: Cow::Borrowed("start_process"),
+                description: Cow::Borrowed("Start a long-lived process that keeps running across tool calls (dev server, watcher, REPL). Returns its id. Poll output with poll_process. Plain pipes, not a PTY."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1968,8 +2280,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "poll_process",
-                description: "Get a managed process's status and latest output tails (8 KiB per stream, older output discarded). Read-only; safe to call repeatedly.",
+                name: Cow::Borrowed("poll_process"),
+                description: Cow::Borrowed("Get a managed process's status and latest output tails (8 KiB per stream, older output discarded). Read-only; safe to call repeatedly."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1982,8 +2294,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "write_process",
-                description: "Send input to a managed process's stdin (newline appended). eof=true instead closes stdin — the 'done writing' signal for REPLs. Returns the process's reaction.",
+                name: Cow::Borrowed("write_process"),
+                description: Cow::Borrowed("Send input to a managed process's stdin (newline appended). eof=true instead closes stdin — the 'done writing' signal for REPLs. Returns the process's reaction."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -1998,8 +2310,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "stop_process",
-                description: "Kill a managed process (and its children) and free its id. Returns its last output.",
+                name: Cow::Borrowed("stop_process"),
+                description: Cow::Borrowed("Kill a managed process (and its children) and free its id. Returns its last output."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2012,8 +2324,8 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function",
             function: FunctionDef {
-                name: "update_plan",
-                description: "Write your task plan. Use for any multi-step work: create steps at the start, mark exactly one step in_progress while working on it, mark completed as you finish each. Replace the whole list every call.",
+                name: Cow::Borrowed("update_plan"),
+                description: Cow::Borrowed("Write your task plan. Use for any multi-step work: create steps at the start, mark exactly one step in_progress while working on it, mark completed as you finish each. Replace the whole list every call."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -2042,9 +2354,29 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
         .into_iter()
         .filter(|t| {
             matches!(
-                t.function.name,
-                "list_dir" | "read_file" | "view_image" | "grep" | "glob" | "fetch_url" | "git"
+                t.function.name.as_ref(),
+                "list_dir"
+                    | "read_file"
+                    | "view_image"
+                    | "grep"
+                    | "glob"
+                    | "fetch_url"
+                    | "git"
+                    | "lsp"
             )
+        })
+        // `git` stays in the Plan toolset for its reads, so the subcommand enum
+        // is narrowed to the read half. Without this the model is shown
+        // `commit`/`checkout`, calls one, and gets the generic "you are in
+        // PLAN mode" rejection instead of a capability it actually has.
+        .map(|mut t| {
+            if t.function.name == "git" {
+                t.function.parameters["properties"]["subcommand"]["enum"] = json!(GIT_READ);
+                t.function.parameters["properties"]["subcommand"]["description"] = json!(
+                    "Read-only git subcommand (Plan mode hides add/commit/branch/checkout/stash)"
+                );
+            }
+            t
         })
         .collect()
 }
@@ -2135,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn git_tool_parses_and_classifies_read_only() {
+    fn git_tool_parses_reads_and_classifies_them_safe() {
         let cwd = std::env::current_dir().unwrap();
         let args = r#"{"subcommand":"status"}"#;
         match parse_tool_action("git", args).unwrap() {
@@ -2144,9 +2476,11 @@ mod tests {
                 path,
                 rev,
                 limit,
+                message,
             } => {
                 assert_eq!(subcommand, "status");
                 assert!(path.is_none() && rev.is_none() && limit.is_none());
+                assert!(message.is_none());
             }
             other => panic!("wrong action: {other:?}"),
         }
@@ -2172,10 +2506,200 @@ mod tests {
         let a = parse_tool_action("git", args).unwrap();
         assert!(a.is_read_only(), "git reads are read-only");
         assert_eq!(a.danger(&cwd), Danger::Safe);
-        // Mutating git subcommands are refused outright.
-        assert!(parse_tool_action("git", r#"{"subcommand":"push"}"#).is_err());
-        assert!(parse_tool_action("git", r#"{"subcommand":"reset","rev":"--hard"}"#).is_err());
         assert!(parse_tool_action("git", "{}").is_err());
+    }
+
+    #[test]
+    fn git_allowlist_is_local_only() {
+        // Remote and history-rewriting operations stay behind run_command,
+        // which runs the dangerous-command detector on a real command line.
+        for sub in [
+            "push", "fetch", "pull", "reset", "rebase", "remote", "clean",
+        ] {
+            assert!(
+                parse_tool_action("git", &format!(r#"{{"subcommand":"{sub}"}}"#)).is_err(),
+                "`git {sub}` must not be reachable through the git tool"
+            );
+        }
+        // And no write subcommand is a read.
+        let cwd = Path::new(".");
+        for sub in GIT_WRITE {
+            let json = if *sub == "commit" {
+                r#"{"subcommand":"commit","message":"m"}"#.to_string()
+            } else {
+                format!(r#"{{"subcommand":"{sub}"}}"#)
+            };
+            let a = parse_tool_action("git", &json).unwrap();
+            assert!(!a.is_read_only(), "git {sub} must not be read-only");
+            assert_ne!(a.danger(cwd), Danger::Safe, "git {sub}");
+        }
+        for sub in GIT_READ {
+            let a = parse_tool_action("git", &format!(r#"{{"subcommand":"{sub}"}}"#)).unwrap();
+            assert!(a.is_read_only(), "git {sub} must stay read-only");
+        }
+    }
+
+    #[test]
+    fn git_danger_escalates_for_destructive_writes() {
+        let cwd = Path::new(".");
+        // Plain writes are Moderate, so BUILD auto-approves them.
+        for args in [
+            r#"{"subcommand":"add","path":"src/main.rs"}"#,
+            r#"{"subcommand":"commit","message":"fix: retry loop"}"#,
+            r#"{"subcommand":"branch","rev":"feature"}"#,
+        ] {
+            assert_eq!(
+                parse_tool_action("git", args).unwrap().danger(cwd),
+                Danger::Moderate,
+                "{args}"
+            );
+        }
+        // checkout/stash can drop uncommitted work the prompt cannot show.
+        for args in [
+            r#"{"subcommand":"checkout","rev":"main"}"#,
+            r#"{"subcommand":"stash","rev":"drop"}"#,
+        ] {
+            assert_eq!(
+                parse_tool_action("git", args).unwrap().danger(cwd),
+                Danger::High,
+                "{args}"
+            );
+        }
+        // A dangerous payload smuggled through an otherwise-Moderate write is
+        // still High, because danger() runs the same detector the shell uses.
+        let sneaky = parse_tool_action(
+            "git",
+            r#"{"subcommand":"commit","message":"rm -rf ~/important"}"#,
+        )
+        .unwrap();
+        assert_eq!(sneaky.danger(cwd), Danger::High);
+    }
+
+    #[test]
+    fn git_commit_requires_a_message() {
+        // stdin is null when git runs, so a message-less commit would hang
+        // until the timeout instead of failing usefully.
+        assert!(parse_tool_action("git", r#"{"subcommand":"commit"}"#).is_err());
+        assert!(parse_tool_action("git", r#"{"subcommand":"commit","message":"  "}"#).is_err());
+        // Whitespace is trimmed rather than passed through as a blank message.
+        match parse_tool_action("git", r#"{"subcommand":"commit","message":"  real  "}"#).unwrap() {
+            Action::Git { message, .. } => assert_eq!(message.as_deref(), Some("real")),
+            other => panic!("wrong action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_command_line_agrees_across_prompt_permissions_and_danger() {
+        // One renderer, so a rule written for the shell still matches the tool.
+        // Defaults are shown, not elided: the prompt must not under-report
+        // what `run_git` actually spawns.
+        for (args, expected) in [
+            (
+                r#"{"subcommand":"commit","message":"fix: retry"}"#,
+                "git commit -m fix: retry",
+            ),
+            (r#"{"subcommand":"add"}"#, "git add -A"),
+            (r#"{"subcommand":"add","path":"a.rs"}"#, "git add -- a.rs"),
+            (r#"{"subcommand":"branch"}"#, "git branch"),
+            (
+                r#"{"subcommand":"branch","rev":"feature"}"#,
+                "git branch feature",
+            ),
+            (r#"{"subcommand":"checkout"}"#, "git checkout -- ."),
+            (
+                r#"{"subcommand":"checkout","rev":"main"}"#,
+                "git checkout main",
+            ),
+            (
+                r#"{"subcommand":"checkout","rev":"main","path":"a.rs"}"#,
+                "git checkout main -- a.rs",
+            ),
+            (
+                r#"{"subcommand":"checkout","path":"a.rs"}"#,
+                "git checkout -- a.rs",
+            ),
+            (r#"{"subcommand":"stash"}"#, "git stash"),
+            (r#"{"subcommand":"stash","rev":"pop"}"#, "git stash pop"),
+            (r#"{"subcommand":"log","rev":"HEAD~2"}"#, "git log HEAD~2"),
+        ] {
+            let a = parse_tool_action("git", args).unwrap();
+            let Action::Git {
+                subcommand,
+                path,
+                rev,
+                message,
+                ..
+            } = &a
+            else {
+                panic!("wrong action for {args}")
+            };
+            assert_eq!(
+                git_command_line(
+                    subcommand,
+                    rev.as_deref(),
+                    path.as_deref(),
+                    message.as_deref(),
+                ),
+                expected,
+                "{args}"
+            );
+            // The approval prompt shows the same thing.
+            assert_eq!(a.describe(), expected, "{args}");
+        }
+        // `limit` is a display-only suffix; it is not a permission operand, and
+        // run_git turns it into --max-count itself.
+        let l = parse_tool_action("git", r#"{"subcommand":"log","limit":5}"#).unwrap();
+        assert_eq!(git_command_line("log", None, None, None), "git log");
+        assert_eq!(l.describe(), "git log (max 5)");
+    }
+
+    #[test]
+    fn plan_mode_hides_git_writes_from_the_schema() {
+        // The model must not be offered `commit` in Plan mode: it would call
+        // it and get a generic "you are in PLAN mode" rejection.
+        let plan_git = plan_tool_defs()
+            .into_iter()
+            .find(|t| t.function.name == "git")
+            .expect("git stays in the plan toolset for its reads");
+        let enum_vals = plan_git.function.parameters["properties"]["subcommand"]["enum"]
+            .as_array()
+            .expect("enum is an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for sub in GIT_WRITE {
+            assert!(
+                !enum_vals.contains(sub),
+                "plan mode must not advertise git {sub}"
+            );
+        }
+        for sub in GIT_READ {
+            assert!(enum_vals.contains(sub), "plan mode lost git {sub}");
+        }
+        // The full toolset still has them.
+        let full_git = tool_defs()
+            .into_iter()
+            .find(|t| t.function.name == "git")
+            .unwrap();
+        let full = full_git.function.parameters["properties"]["subcommand"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for sub in GIT_WRITE {
+            assert!(full.contains(sub), "build mode lost git {sub}");
+        }
+    }
+
+    #[test]
+    fn git_writes_are_not_undoable_and_do_not_fire_hooks() {
+        // Snapshotting a pre-image here would blind-write stale content over a
+        // later checkout. Matches the existing RunCommand rule.
+        let a = parse_tool_action("git", r#"{"subcommand":"commit","message":"m"}"#).unwrap();
+        assert!(!a.mutates_files());
+        let b = parse_tool_action("git", r#"{"subcommand":"checkout","rev":"main"}"#).unwrap();
+        assert!(!b.mutates_files());
     }
 
     #[test]
@@ -2366,6 +2890,169 @@ mod tests {
         rt.block_on(action.perform_with_diff(cwd, None))
             .expect("perform should succeed")
             .0
+    }
+
+    /// Drive an async tools fn from a sync test. IO and time are both required
+    /// because these spawn processes under a timeout, unlike `perform_sync`.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("test runtime")
+            .block_on(f)
+    }
+
+    /// A throwaway repo with one commit on `main`.
+    fn git_fixture(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lc-git-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git must be installed for this test");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        sh(&["init", "-q", "-b", "main"]);
+        sh(&["config", "user.email", "t@example.com"]);
+        sh(&["config", "user.name", "T"]);
+        sh(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        sh(&["add", "a.txt"]);
+        sh(&["commit", "-q", "-m", "initial"]);
+        dir
+    }
+
+    fn git_out(
+        dir: &Path,
+        sub: &str,
+        path: Option<&str>,
+        rev: Option<&str>,
+        msg: Option<&str>,
+    ) -> String {
+        block_on(run_git(dir, sub, path, rev, None, msg)).expect("run_git")
+    }
+
+    #[test]
+    fn git_writes_commit_branch_and_checkout_for_real() {
+        let dir = git_fixture("writes");
+        // `add` with no path stages the whole tree, deletions included.
+        std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        git_out(&dir, "add", None, None, None);
+        let st = git_out(&dir, "status", None, None, None);
+        assert!(st.contains("b.txt"), "b.txt not staged:\n{st}");
+
+        // `commit` takes the message as an operand, not on stdin.
+        let out = git_out(&dir, "commit", None, None, Some("add b, drop a"));
+        assert!(!out.contains("nothing to commit"), "{out}");
+
+        // `branch` creates; with no rev it lists.
+        git_out(&dir, "branch", None, Some("feature"), None);
+        let list = git_out(&dir, "branch", None, None, None);
+        assert!(list.contains("feature"), "branch not created:\n{list}");
+
+        // `checkout` switches.
+        git_out(&dir, "checkout", None, Some("feature"), None);
+        let br = git_out(&dir, "status", None, None, None);
+        assert!(br.contains("feature"), "did not switch:\n{br}");
+
+        // `checkout` with a path restores just that file from HEAD.
+        std::fs::write(dir.join("b.txt"), "clobbered\n").unwrap();
+        git_out(&dir, "checkout", Some("b.txt"), None, None);
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "two\n");
+
+        // `stash push` then `stash pop` round-trips an edit.
+        std::fs::write(dir.join("b.txt"), "wip\n").unwrap();
+        git_out(&dir, "stash", None, Some("push"), None);
+        assert_ne!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "wip\n");
+        git_out(&dir, "stash", None, Some("pop"), None);
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "wip\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The words `git_command_line` promises must actually reach git.
+    ///
+    /// The two renderers are written independently on purpose (one is a human
+    /// prompt, one is a pattern key), so a test that only checked each against
+    /// a hand-written string would pass while they disagreed with each other.
+    /// This runs the real binary and reads back what it acted on.
+    #[test]
+    fn git_command_line_promises_match_what_git_actually_receives() {
+        let dir = git_fixture("promise");
+        let st = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--", "a.txt"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // `git add -A` with no pathspec: the whole tree, deletions included.
+        std::fs::write(dir.join("c.txt"), "three\n").unwrap();
+        git_out(&dir, "add", None, None, None);
+        let staged = String::from_utf8_lossy(&st.stdout).to_string();
+        assert!(staged.is_empty(), "fixture should start clean: {staged:?}");
+        let after = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string();
+        assert!(after.contains("c.txt"), "add -A staged nothing: {after:?}");
+        assert_eq!(git_command_line("add", None, None, None), "git add -A");
+
+        // `git branch` with no rev lists rather than creating something.
+        let listed = git_out(&dir, "branch", None, None, None);
+        assert!(!listed.trim().is_empty());
+        assert_eq!(git_command_line("branch", None, None, None), "git branch");
+
+        // `git checkout` with no rev and no path restores the whole tree.
+        std::fs::write(dir.join("a.txt"), "clobbered\n").unwrap();
+        git_out(&dir, "checkout", None, None, None);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one\n",
+            "bare `git checkout` must restore the tree, not do nothing"
+        );
+        assert_eq!(
+            git_command_line("checkout", None, None, None),
+            "git checkout -- ."
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_commit_without_a_message_fails_fast_instead_of_hanging() {
+        // run_git is spawned with a null stdin, so letting git reach for an
+        // editor would burn the whole 60s timeout.
+        let dir = git_fixture("nomsg");
+        let err = block_on(run_git(&dir, "commit", None, None, None, None)).unwrap_err();
+        assert!(format!("{err:#}").contains("message"), "got: {err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_rejects_remote_subcommands_at_both_layers() {
+        // The parse layer (model-facing) and run_git (defence in depth).
+        let dir = git_fixture("remote");
+        for sub in ["push", "fetch", "reset"] {
+            assert!(parse_tool_action("git", &format!(r#"{{"subcommand":"{sub}"}}"#)).is_err());
+            assert!(
+                block_on(run_git(&dir, sub, None, None, None, None)).is_err(),
+                "{sub}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

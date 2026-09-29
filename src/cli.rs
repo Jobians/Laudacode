@@ -61,6 +61,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Suppress the brand banner and identity block, leaving only results
+    #[arg(long, global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
